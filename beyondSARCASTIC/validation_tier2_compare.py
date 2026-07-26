@@ -185,6 +185,16 @@ def main():
     ap.add_argument('--altitude', type=float, default=3000.0)
     ap.add_argument('--fc', type=float, default=10e9)
     ap.add_argument('--bandwidth', type=float, default=600e6)
+    ap.add_argument('--az-res', type=float, default=None,
+                     help='desired cross-range resolution (m). When set, aperture length is '
+                          'derived from standoff+wavelength (d_theta=lambda/(2*az_res), '
+                          'aperture=d_theta*standoff) instead of a fixed 400m, and --pulses is '
+                          'auto-bumped to the Nyquist minimum (P=standoff*lambda/az_res^2, same '
+                          'formula as radar_params.py) if too low. Without this, aperture stays '
+                          'a fixed 400m regardless of standoff -- fine at short (~8km) standoff, '
+                          'but at longer standoff that 400m subtends a much smaller angle, so '
+                          'cross-range resolution silently gets much coarser than whatever the '
+                          '--pulses count might suggest.')
     ap.add_argument('--no-clutter', action='store_true',
                      help='skip concrete ground-clutter background (buildings only, on black)')
     args = ap.parse_args()
@@ -195,7 +205,25 @@ def main():
     facets = make_building_scene(xp, args.footprint, args.density, seed=0)
     print(f"{facets['n_buildings']} buildings, {facets['n_facets']} facets")
 
-    squint_len = 400.0
+    wavelength = C / args.fc
+    if args.az_res is not None:
+        d_theta = wavelength / (2.0 * args.az_res)
+        squint_len = d_theta * args.standoff
+        min_pulses = int(np.ceil(args.standoff * wavelength / (args.az_res ** 2)))
+        edge_deg = (args.footprint / args.standoff) * 180.0 / np.pi
+        print(f"--az-res {args.az_res}m -> aperture={squint_len:.0f}m, "
+              f"edge-to-edge incidence-angle swing over the scene ~{edge_deg:.2f} deg")
+        if args.pulses < min_pulses:
+            print(f"--pulses {args.pulses} is below Nyquist for this aperture/resolution "
+                  f"(need >={min_pulses} -- azimuth under-sampling doesn't corrupt the SBR-vs-ASC "
+                  f"comparison, since both branches share the same aperture/backprojection and "
+                  f"any aliasing shows up identically in both and cancels in the difference, but "
+                  f"it does add non-physical streaking to each image individually). "
+              f"Auto-bumping --pulses {args.pulses} -> {min_pulses}.")
+            args.pulses = min_pulses
+    else:
+        squint_len = 400.0
+
     u = np.linspace(-squint_len / 2, squint_len / 2, args.pulses)
     plat = xp.asarray(np.column_stack([
         u, np.full(args.pulses, -args.standoff), np.full(args.pulses, args.altitude)
@@ -219,7 +247,8 @@ def main():
               f"clamps/aliases instead of erroring -- that's what produced striped, "
               f"unfocused images at larger footprints before this check existed). "
               f"Auto-bumping --freq {args.freq} -> {min_freq}.")
-        if min_freq > 1024:
+        real_bw = 300e6
+        if min_freq > 1024 and args.bandwidth < 0.95 * real_bw:
             # NOTE: do not suggest shrinking bandwidth down to whatever hits
             # a small K -- the naive delta_r = c/(2B) formula understates
             # what real hardware actually uses. TerraSAR-X runs up to
@@ -230,8 +259,9 @@ def main():
             # bandwidth well above the textbook minimum. radar_params.py's
             # own "REALITY CHECK" section computes B_real via that same
             # naive formula (75MHz for 2m) and is short of the real
-            # TerraSAR-X spec for the same reason.
-            real_bw = 300e6
+            # TerraSAR-X spec for the same reason. Only fires below ~300MHz
+            # -- if you're already at or above real hardware bandwidth,
+            # there's no "cheaper, still-realistic" fix to suggest.
             real_K = int(np.ceil(needed_window / (C / (2.0 * real_bw))))
             print(f"  ({min_freq} freq samples at {args.bandwidth/1e6:.0f}MHz is a lot of "
                   f"FFT/interp work per pulse. Resist the urge to fix that by lowering "
@@ -241,6 +271,12 @@ def main():
                   f"K~={real_K} needed for this scene/geometry -- that's the real cost, not "
                   f"something to shortcut around. Pass --bandwidth 300e6 to match real hardware "
                   f"instead of the {args.bandwidth/1e6:.0f}MHz default.)")
+        elif min_freq > 1024:
+            print(f"  ({min_freq} freq samples at {args.bandwidth/1e6:.0f}MHz is real cost, not "
+                  f"a shortcut opportunity -- you're already at or above the ~300MHz TerraSAR-X-"
+                  f"consistent bandwidth used elsewhere in this project, so there's no 'cheaper "
+                  f"but still realistic' bandwidth to fall back to. This is genuinely what it "
+                  f"costs to cover this scene's range window at this resolution.)")
         args.freq = min_freq
 
     freqs = xp.asarray(args.fc + np.linspace(-args.bandwidth / 2, args.bandwidth / 2, args.freq))
