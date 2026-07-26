@@ -1,0 +1,25 @@
+{
+  "backend": "gpu",
+  "footprint_m": 1000.0,
+  "density_per_km2": 200.0,
+  "n_buildings": 200,
+  "n_facets": 1000,
+  "n_rays": 10000,
+  "n_pulses": 200,
+  "n_freq": 64,
+  "dense_sbr": {
+    "n_rays": 10000,
+    "t_intersect_s": 93.86816089914646,
+    "t_phase_s": 1.3441217994550243,
+    "t_total_s": 95.21228269860148,
+    "t_per_pulse_ms": 476.0614134930074
+  },
+  "asc_cached": {
+    "n_facets": 1000,
+    "t_build_s": 1.7200014553964138e-05,
+    "t_eval_s": 0.21253650006838143,
+    "t_total_s": 0.2125537000829354,
+    "t_per_pulse_ms": 1.0626825003419071
+  },
+  "speedup": 447.98085349089644
+}
