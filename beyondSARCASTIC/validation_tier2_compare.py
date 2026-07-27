@@ -19,6 +19,8 @@ Usage:
 import argparse
 import time
 import json
+import os
+import hashlib
 import numpy as np
 import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
@@ -104,6 +106,52 @@ def required_freq_samples(plat_np, ref_np, grid_np, bandwidth, margin_factor=1.1
     needed_window = 2.0 * maxdr * margin_factor
     range_res = C / (2.0 * bandwidth)
     return int(np.ceil(needed_window / range_res)), maxdr, needed_window
+
+
+PHASE_HISTORY_CACHE_PARAMS = [
+    'footprint', 'density', 'rays', 'pulses', 'standoff', 'altitude', 'fc', 'bandwidth', 'freq',
+]
+
+
+def phase_history_cache_key(args, scene_seed=0):
+    """
+    Deterministic key over exactly the parameters that change s_sbr/s_asc
+    (the expensive dense-SBR ray-traced phase history and its ASC-cached
+    counterpart) -- NOT img-size, --no-clutter, or plotting/scoring
+    options, since none of those touch the forward sim at all. Computed
+    from `args` AFTER all auto-bump logic has resolved (--pulses via the
+    Nyquist guard, --freq via the range-window guard), so a cache built
+    from a run that needed auto-bumping is correctly keyed on the
+    resolved values, not whatever the user originally typed.
+    """
+    parts = [f"{p}={getattr(args, p)}" for p in PHASE_HISTORY_CACHE_PARAMS]
+    parts.append(f"scene_seed={scene_seed}")
+    raw = "|".join(parts)
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
+    return digest, raw
+
+
+def load_phase_history_cache(cache_dir, key):
+    path = os.path.join(cache_dir, f"{key}.npz")
+    if not os.path.exists(path):
+        return None
+    data = np.load(path)
+    return dict(
+        s_sbr=data['s_sbr'], s_asc=data['s_asc'], plat=data['plat'], freqs=data['freqs'],
+        sbr_ms_per_pulse=float(data['sbr_ms_per_pulse']), sbr_n_rays=int(data['sbr_n_rays']),
+        asc_ms_per_pulse=float(data['asc_ms_per_pulse']),
+    )
+
+
+def save_phase_history_cache(cache_dir, key, raw_params, s_sbr, s_asc, plat, freqs, sbr_stats, asc_stats):
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{key}.npz")
+    np.savez(path, s_sbr=s_sbr, s_asc=s_asc, plat=plat, freqs=freqs,
+              sbr_ms_per_pulse=sbr_stats['t_per_pulse_ms'], sbr_n_rays=sbr_stats['n_rays'],
+              asc_ms_per_pulse=asc_stats['t_per_pulse_ms'])
+    with open(os.path.join(cache_dir, f"{key}.params.txt"), 'w') as f:
+        f.write(raw_params + "\n")
+    return path
 
 
 def per_building_ssim(facets, db_sbr, db_asc, mag_sbr, mag_asc, phase_sbr, phase_asc,
@@ -197,6 +245,11 @@ def main():
                           '--pulses count might suggest.')
     ap.add_argument('--no-clutter', action='store_true',
                      help='skip concrete ground-clutter background (buildings only, on black)')
+    ap.add_argument('--cache-dir', type=str, default='tier2_cache',
+                     help='where cached phase histories (s_sbr/s_asc) are stored')
+    ap.add_argument('--no-cache', action='store_true',
+                     help='ignore and do not write the phase-history cache -- always recompute '
+                          'the expensive dense-SBR/ASC forward sim from scratch')
     args = ap.parse_args()
 
     xp, on_gpu = get_backend(args.gpu)
@@ -282,13 +335,43 @@ def main():
     freqs = xp.asarray(args.fc + np.linspace(-args.bandwidth / 2, args.bandwidth / 2, args.freq))
     R_ref = compute_ref_ranges(xp, plat, ref_pos)
 
-    print("\n[1/4] Forward sim: dense SBR...")
-    s_sbr, sbr_stats = run_dense_sbr_timed(xp, on_gpu, facets, plat, aim_pts, freqs, ref_pos)
-    print(f"  {sbr_stats['t_per_pulse_ms']:.2f} ms/pulse")
+    # Cache key is computed here, AFTER --pulses and --freq have both been
+    # auto-bumped to their resolved values above -- keying on the raw CLI
+    # input would let two runs that resolve to the identical forward sim
+    # (e.g. --freq 64 and --freq 2278, if 2278 is what 64 auto-bumps to
+    # for this scene) miss each other's cache.
+    cache_key, cache_raw = phase_history_cache_key(args)
+    cached = None if args.no_cache else load_phase_history_cache(args.cache_dir, cache_key)
 
-    print("[2/4] Forward sim: ASC-cached...")
-    s_asc, asc_stats = run_asc_cached(xp, on_gpu, facets, plat, freqs, ref_pos)
-    print(f"  {asc_stats['t_per_pulse_ms']:.2f} ms/pulse")
+    if cached is not None:
+        print(f"\n[1-2/4] Loaded cached phase history ({cache_key}) -- "
+              f"skipping dense-SBR/ASC forward sim entirely.")
+        print(f"  (cached at {cached['sbr_ms_per_pulse']:.2f} ms/pulse dense SBR, "
+              f"{cached['asc_ms_per_pulse']:.2f} ms/pulse ASC, {cached['sbr_n_rays']} rays)")
+        s_sbr = xp.asarray(cached['s_sbr'])
+        s_asc = xp.asarray(cached['s_asc'])
+        sbr_stats = dict(t_per_pulse_ms=cached['sbr_ms_per_pulse'], n_rays=cached['sbr_n_rays'])
+        asc_stats = dict(t_per_pulse_ms=cached['asc_ms_per_pulse'])
+        # plat/freqs are already built identically above from the same
+        # (now-resolved) args that produced this cache key, so no need to
+        # overwrite them from the cache file -- they're already correct.
+    else:
+        print("\n[1/4] Forward sim: dense SBR...")
+        s_sbr, sbr_stats = run_dense_sbr_timed(xp, on_gpu, facets, plat, aim_pts, freqs, ref_pos)
+        print(f"  {sbr_stats['t_per_pulse_ms']:.2f} ms/pulse")
+
+        print("[2/4] Forward sim: ASC-cached...")
+        s_asc, asc_stats = run_asc_cached(xp, on_gpu, facets, plat, freqs, ref_pos)
+        print(f"  {asc_stats['t_per_pulse_ms']:.2f} ms/pulse")
+
+        if not args.no_cache:
+            path = save_phase_history_cache(
+                args.cache_dir, cache_key, cache_raw, to_numpy(s_sbr), to_numpy(s_asc),
+                to_numpy(plat), to_numpy(freqs), sbr_stats, asc_stats)
+            print(f"  Cached phase history -> {path} (key {cache_key}). Re-running with the "
+                  f"same footprint/density/rays/pulses/standoff/altitude/fc/bandwidth/freq will "
+                  f"reload this instead of recomputing -- img-size, --no-clutter, and scoring "
+                  f"changes are all free to vary without invalidating it.")
 
     if not args.no_clutter:
         clutter_pts = make_ground_clutter(args.footprint, material='concrete', seed=1)
