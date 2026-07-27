@@ -23,6 +23,7 @@ import os
 import hashlib
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.ndimage import uniform_filter
 from skimage.metrics import structural_similarity as ssim
 
 from dense_sbr_demo import (make_building_scene, get_backend, C, make_aim_grid,
@@ -30,6 +31,7 @@ from dense_sbr_demo import (make_building_scene, get_backend, C, make_aim_grid,
                              compute_layover_margin)
 from sbr_vs_asc_compare import run_dense_sbr_timed, run_asc_cached
 
+plt.close("all")
 
 def backproject(xp, s, plat_pos, freqs, grid_x, grid_y, fc, R_ref):
     """Time-domain backprojection, backend-agnostic (numpy or cupy).
@@ -72,6 +74,52 @@ def to_numpy(a):
 
 def compute_ref_ranges(xp, plat, ref_pos):
     return xp.linalg.norm(plat - ref_pos[None, :], axis=1)
+
+
+def complex_coherence(img_a, img_b):
+    """
+    Standard InSAR-style complex coherence: |sum(a * conj(b))| / sqrt(sum(|a|^2) * sum(|b|^2)).
+    1.0 = perfect agreement (magnitude AND phase both aligned), 0 = totally
+    uncorrelated. Unlike phase RMS, it's sensitive to amplitude-weighted
+    agreement jointly, not phase alone -- a region where SBR and ASC agree
+    on phase but disagree on which pixels are bright still shows up as
+    reduced coherence. Same dilution problem as whole-image SSIM applies
+    here too: coherence over the whole noiseless scene looks deceptively
+    high because real per-building disagreement is diluted by the much
+    larger area of near-identical shared clutter background -- compute it
+    per-building for the number that matches the deck's "same sector"
+    criterion.
+    """
+    num = np.abs(np.sum(img_a * np.conj(img_b)))
+    den = np.sqrt(np.sum(np.abs(img_a) ** 2) * np.sum(np.abs(img_b) ** 2)) + 1e-12
+    return float(num / den)
+
+
+def coherence_map(img_a, img_b, win=7):
+    """
+    Spatially-resolved local coherence (the actual InSAR-style coherence
+    MAP, not just a scalar) -- sliding-window version of complex_coherence,
+    win x win pixels per window. Reveals WHERE disagreement lives instead
+    of averaging it away into one number.
+
+    Filters the complex cross-product itself (uniform_filter on real/imag
+    parts separately, then recombine), NOT the magnitude of the product --
+    filtering magnitude first would throw away the phase information that
+    makes this coherence rather than just smoothed amplitude agreement.
+
+    Expected structure in this scene: ground clutter is added IDENTICALLY
+    to both branches (s_sbr += s_clutter, s_asc += s_clutter in main()),
+    so background pixels should read close to coherence=1 almost by
+    construction -- real disagreement should show up localized at
+    buildings, not spread diffusely across the image. A map that's low
+    everywhere (not just at structures) would point at something wrong
+    with the shared clutter/backprojection path, not compression fidelity.
+    """
+    cross = img_a * np.conj(img_b)
+    cross_f = uniform_filter(to_numpy(cross.real), win) + 1j * uniform_filter(to_numpy(cross.imag), win)
+    num = np.abs(cross_f)
+    den = np.sqrt(uniform_filter(np.abs(to_numpy(img_a)) ** 2, win) * uniform_filter(np.abs(to_numpy(img_b)) ** 2, win)) + 1e-12
+    return num / den
 
 
 def required_freq_samples(plat_np, ref_np, grid_np, bandwidth, margin_factor=1.15):
@@ -213,10 +261,27 @@ def per_building_ssim(facets, db_sbr, db_asc, mag_sbr, mag_asc, phase_sbr, phase
         dphase = np.angle(np.exp(1j * (p_sbr - p_asc)))
         wgt = m_sbr / (m_sbr.sum() + 1e-12)
         phase_rms_b = float(np.degrees(np.sqrt(np.sum(wgt * dphase ** 2))))
+        # signed bias (not squared) -- distinguishes a consistent offset
+        # (structural bug, e.g. mocomp/reference-range convention mismatch
+        # between the two branches) from symmetric random scatter, which
+        # RMS alone can't tell apart
+        phase_bias_b = float(np.degrees(np.sum(wgt * dphase)))
+        # max error among SIGNIFICANT pixels only (>5% of this crop's own
+        # peak) -- unmasked, this is meaningless: noise-floor pixels have
+        # essentially uniform random phase and would dominate a max-error
+        # stat with garbage that has nothing to do with compression fidelity
+        sig_mask = m_sbr > 0.05 * (m_sbr.max() + 1e-12)
+        phase_max_b = float(np.degrees(np.abs(dphase[sig_mask]).max())) if sig_mask.any() else 0.0
+
+        c_sbr = m_sbr * np.exp(1j * p_sbr)
+        c_asc = m_asc * np.exp(1j * p_asc)
+        coherence_b = complex_coherence(c_sbr, c_asc)
 
         results.append(dict(building=i, cx=float(cx[i]), cy=float(cy[i]), height_m=float(h[i]),
                              crop_px=[int(i_hi - i_lo), int(j_hi - j_lo)], ssim=float(s),
-                             amp_rms=amp_rms_b, phase_rms_deg=phase_rms_b, skipped=False))
+                             amp_rms=amp_rms_b, phase_rms_deg=phase_rms_b,
+                             phase_bias_deg=phase_bias_b, phase_max_deg=phase_max_b,
+                             coherence=coherence_b, skipped=False))
     return results
 
 
@@ -409,6 +474,19 @@ def main():
     dphase = np.angle(np.exp(1j * (phase_sbr - phase_asc)))
     w = mag_sbr / (mag_sbr.sum() + 1e-12)
     phase_rms = np.sqrt(np.sum(w * dphase ** 2))
+    # signed bias -- a consistent offset (not centered on zero) points at a
+    # structural mismatch (e.g. mocomp/reference-range convention) between
+    # the two branches, which RMS alone can't distinguish from symmetric
+    # random scatter
+    phase_bias = np.sum(w * dphase)
+    # max error among significant pixels only -- unmasked, noise-floor
+    # phase is uniform-random garbage and would dominate a max stat
+    sig_mask_whole = mag_sbr > 0.05 * (mag_sbr.max() + 1e-12)
+    phase_max = np.abs(dphase[sig_mask_whole]).max() if sig_mask_whole.any() else 0.0
+    # complex coherence -- the InSAR-standard joint amplitude+phase
+    # agreement metric, 0-1 like SSIM; sensitive to cases where phase
+    # matches but the two disagree on which pixels are bright
+    coherence = complex_coherence(to_numpy(img_sbr), to_numpy(img_asc))
 
     pass_ssim = ssim_score >= 0.95
     print(f"\n=== Tier 2 validation result (whole image -- diluted/inflated by shared "
@@ -416,6 +494,10 @@ def main():
     print(f"SSIM:            {ssim_score:.4f}   ({'PASS' if pass_ssim else 'FAIL'} vs. >= 0.95 criterion)")
     print(f"Amplitude RMS:   {amp_rms:.4f}  (normalized, 0=identical)")
     print(f"Phase RMS:       {np.degrees(phase_rms):.2f} deg (magnitude-weighted)")
+    print(f"Phase bias:      {np.degrees(phase_bias):+.2f} deg (signed, magnitude-weighted -- "
+          f"far from 0 flags a systematic offset, not just scatter)")
+    print(f"Phase max error: {np.degrees(phase_max):.2f} deg (worst pixel among those >5% of peak)")
+    print(f"Coherence:       {coherence:.4f}  (InSAR-style |<a,b*>|/sqrt(<|a|^2><|b|^2>), 1=identical)")
 
     print(f"\n=== Tier 2 validation result (per building -- matches the Validation "
           f"slide's actual 'per structure type, same sector' criterion) ===")
@@ -425,21 +507,37 @@ def main():
     scored = [r for r in per_bldg if not r['skipped']]
     skipped = [r for r in per_bldg if r['skipped']]
     b_ssim = np.array([r['ssim'] for r in scored])
+    b_coherence = np.array([r['coherence'] for r in scored])
+    b_phase_rms = np.array([r['phase_rms_deg'] for r in scored])
+    b_phase_bias = np.array([r['phase_bias_deg'] for r in scored])
     n_pass_b = int((b_ssim >= 0.95).sum())
     print(f"Scored {len(scored)}/{len(per_bldg)} buildings "
           f"({len(skipped)} skipped -- crop ran off the image edge)")
     if len(scored) > 0:
-        print(f"SSIM:  mean={b_ssim.mean():.4f}  median={np.median(b_ssim):.4f}  "
+        print(f"SSIM:       mean={b_ssim.mean():.4f}  median={np.median(b_ssim):.4f}  "
               f"min={b_ssim.min():.4f}  max={b_ssim.max():.4f}")
+        print(f"Coherence:  mean={b_coherence.mean():.4f}  median={np.median(b_coherence):.4f}  "
+              f"min={b_coherence.min():.4f}  max={b_coherence.max():.4f}")
+        print(f"Phase RMS:  mean={b_phase_rms.mean():.2f}deg  median={np.median(b_phase_rms):.2f}deg  "
+              f"max={b_phase_rms.max():.2f}deg")
+        print(f"Phase bias: mean={b_phase_bias.mean():+.2f}deg  "
+              f"|mean| across buildings -- a per-building bias that's consistently signed "
+              f"one way (not scattered around 0) is the structural-mismatch tell")
         print(f"Buildings passing (SSIM>=0.95): {n_pass_b}/{len(scored)} "
               f"({100*n_pass_b/len(scored):.0f}%)")
         worst = sorted(scored, key=lambda r: r['ssim'])[:5]
-        print("Worst 5 buildings:")
+        print("Worst 5 buildings (by SSIM):")
         for r in worst:
             print(f"  building {r['building']:4d}  (x={r['cx']:7.1f}, y={r['cy']:7.1f}, "
-                  f"h={r['height_m']:4.1f}m)  SSIM={r['ssim']:.4f}  "
+                  f"h={r['height_m']:4.1f}m)  SSIM={r['ssim']:.4f}  coherence={r['coherence']:.4f}  "
                   f"amp_rms={r['amp_rms']:.4f}  phase_rms={r['phase_rms_deg']:.1f}deg  "
+                  f"phase_bias={r['phase_bias_deg']:+.1f}deg  phase_max={r['phase_max_deg']:.1f}deg  "
                   f"crop={r['crop_px'][0]}x{r['crop_px'][1]}px")
+        worst_coh = sorted(scored, key=lambda r: r['coherence'])[:5]
+        print("Worst 5 buildings (by coherence -- may not be the same set as worst-by-SSIM):")
+        for r in worst_coh:
+            print(f"  building {r['building']:4d}  (x={r['cx']:7.1f}, y={r['cy']:7.1f}, "
+                  f"h={r['height_m']:4.1f}m)  coherence={r['coherence']:.4f}  SSIM={r['ssim']:.4f}")
 
     fig, axes = plt.subplots(1, 4, figsize=(19, 5.2))
     for ax, db, title in zip(axes[:2], [db_sbr, db_asc], ['Dense SBR', 'ASC-cached']):
@@ -472,12 +570,73 @@ def main():
     fig.savefig('tier2_sbr_vs_asc_comparison.png', dpi=150)
     print("\nSaved tier2_sbr_vs_asc_comparison.png")
 
+    # ---- Separate figure: phase/coherence, on its own since it answers a
+    # different question (does phase agree spatially, not just does the
+    # image look the same) and was crowding the main 4-panel comparison. ----
+    fig2, ax2 = plt.subplots(1, 4, figsize=(19, 5.2))
+
+    # Spatially-resolved coherence map -- reveals WHERE disagreement lives,
+    # not just one averaged-away number. Clutter is added identically to
+    # both branches, so background should read near-1; low coherence should
+    # be localized at buildings if compression fidelity is the real story.
+    coh_map = coherence_map(img_sbr, img_asc, win=7)
+    im3 = ax2[0].imshow(coh_map, cmap='viridis', vmin=0, vmax=1, origin='lower',
+                            extent=[-args.footprint/2, args.footprint/2]*2)
+    ax2[0].set_title(f'Coherence map (7x7 window)\nwhole-image coherence={coherence:.3f}')
+    ax2[0].set_xlabel('cross-range (m)')
+    ax2[0].set_ylabel('range (m)')
+    plt.colorbar(im3, ax=ax2[0], fraction=0.046)
+
+    # Spatial phase-difference map, magnitude-masked -- dphase is already a
+    # full (img_size, img_size) array (computed above for the whole-image
+    # scalar stats), just never plotted as a map before. Masked to the same
+    # >5% peak threshold as phase_max so noise-floor pixels (uniform random
+    # phase by construction) don't wash out the real disagreement visually.
+    dphase_deg = np.degrees(dphase)
+    dphase_masked = np.where(sig_mask_whole, dphase_deg, np.nan)
+    im4 = ax2[1].imshow(dphase_masked, cmap='twilight_shifted', vmin=-20, vmax=20, origin='lower',
+                            extent=[-args.footprint/2, args.footprint/2]*2)
+    ax2[1].set_title(f'Phase difference (deg), masked to >5% peak\n'
+                         f'bias={np.degrees(phase_bias):+.2f}deg, RMS={np.degrees(phase_rms):.2f}deg')
+    ax2[1].set_xlabel('cross-range (m)')
+    ax2[1].set_ylabel('range (m)')
+    plt.colorbar(im4, ax=ax2[1], fraction=0.046, label='deg')
+
+    if len(scored) > 0:
+        heights = np.array([r['height_m'] for r in scored])
+        sc = ax2[3].scatter(b_ssim, b_coherence, c=heights, cmap='viridis', s=26, edgecolor='k', linewidth=0.3)
+        lo = min(b_ssim.min(), b_coherence.min()) - 0.01
+        ax2[3].plot([lo, 1], [lo, 1], 'k--', linewidth=0.8, label='y=x')
+        ax2[3].set_xlabel('SSIM')
+        ax2[3].set_ylabel('coherence')
+        ax2[3].set_title('Per-building: SSIM vs. coherence\n(color = building height)')
+        ax2[3].legend(fontsize=8)
+        plt.colorbar(sc, ax=ax2[3], fraction=0.046, label='height (m)')
+
+        ax2[2].hist(b_phase_rms, bins=min(20, max(5, len(scored)//3)), color='#B85C00', edgecolor='white')
+        ax2[2].set_title(f'Per-building phase RMS\nmean={b_phase_rms.mean():.2f}deg, '
+                             f'max={b_phase_rms.max():.2f}deg')
+        ax2[2].set_xlabel('phase RMS (deg)')
+        ax2[2].set_ylabel('buildings')
+    else:
+        ax2[1, 0].text(0.5, 0.5, 'no buildings scored', ha='center', va='center')
+        ax2[1, 1].text(0.5, 0.5, 'no buildings scored', ha='center', va='center')
+
+    fig2.suptitle(f'Tier 2 phase/coherence detail: {facets["n_buildings"]} buildings, '
+                  f'{args.footprint:.0f}m x {args.footprint:.0f}m, {args.pulses} pulses')
+    fig2.tight_layout()
+    fig2.savefig('tier2_phase_coherence.png', dpi=150)
+    print("Saved tier2_phase_coherence.png")
+
     result = dict(
         footprint_m=args.footprint, density_per_km2=args.density,
         n_buildings=facets['n_buildings'], n_facets=facets['n_facets'],
         n_pulses=args.pulses, n_rays=sbr_stats['n_rays'],
         whole_image=dict(ssim=float(ssim_score), amp_rms=float(amp_rms),
-                          phase_rms_deg=float(np.degrees(phase_rms)), pass_ssim=bool(pass_ssim)),
+                          phase_rms_deg=float(np.degrees(phase_rms)),
+                          phase_bias_deg=float(np.degrees(phase_bias)),
+                          phase_max_deg=float(np.degrees(phase_max)),
+                          coherence=float(coherence), pass_ssim=bool(pass_ssim)),
         per_building_summary=dict(
             n_scored=len(scored), n_skipped=len(skipped),
             n_pass=n_pass_b,
@@ -486,6 +645,13 @@ def main():
             ssim_median=float(np.median(b_ssim)) if len(scored) else None,
             ssim_min=float(b_ssim.min()) if len(scored) else None,
             ssim_max=float(b_ssim.max()) if len(scored) else None,
+            coherence_mean=float(b_coherence.mean()) if len(scored) else None,
+            coherence_median=float(np.median(b_coherence)) if len(scored) else None,
+            coherence_min=float(b_coherence.min()) if len(scored) else None,
+            coherence_max=float(b_coherence.max()) if len(scored) else None,
+            phase_rms_mean_deg=float(b_phase_rms.mean()) if len(scored) else None,
+            phase_rms_max_deg=float(b_phase_rms.max()) if len(scored) else None,
+            phase_bias_mean_deg=float(b_phase_bias.mean()) if len(scored) else None,
         ),
         per_building=per_bldg,
         dense_sbr_ms_per_pulse=sbr_stats['t_per_pulse_ms'],
