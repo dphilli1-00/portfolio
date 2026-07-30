@@ -1,0 +1,1 @@
+footprint=200.0|density=200.0|rays=90|pulses=150|standoff=8000.0|altitude=3000.0|fc=10000000000.0|bandwidth=200000000.0|freq=297|scene_seed=0

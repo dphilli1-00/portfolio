@@ -1,0 +1,27 @@
+{
+  "args": {
+    "gpu": false,
+    "footprint": 200.0,
+    "density": 200.0,
+    "rays": 40,
+    "pulses": 10,
+    "freq": 16,
+    "standoff": 8000.0,
+    "altitude": 3000.0,
+    "fc": 10000000000.0,
+    "bandwidth": 600000000.0,
+    "ground_material": "dry_soil",
+    "max_bounces": 2
+  },
+  "stats": {
+    "counts": {
+      "order1": 163,
+      "order2": 185,
+      "order3": 0
+    },
+    "t_total_s": 0.29022882701247,
+    "t_per_pulse_ms": 29.022882701247,
+    "n_facets_buildings": 40,
+    "n_facets_combined": 65
+  }
+}

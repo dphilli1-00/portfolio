@@ -1,0 +1,6 @@
+numpy
+matplotlib
+scipy
+
+# Optional, for GPU-accelerated ray tracing once modules are ported (see README):
+# torch

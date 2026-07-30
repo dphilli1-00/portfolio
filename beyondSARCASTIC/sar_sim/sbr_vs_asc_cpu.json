@@ -1,0 +1,25 @@
+{
+  "backend": "cpu",
+  "footprint_m": 200.0,
+  "density_per_km2": 200.0,
+  "n_buildings": 8,
+  "n_facets": 40,
+  "n_rays": 900,
+  "n_pulses": 20,
+  "n_freq": 32,
+  "dense_sbr": {
+    "n_rays": 900,
+    "t_intersect_s": 0.2160765059888945,
+    "t_phase_s": 0.006395147989678662,
+    "t_total_s": 0.22247165397857316,
+    "t_per_pulse_ms": 11.123582698928658
+  },
+  "asc_cached": {
+    "n_facets": 40,
+    "t_build_s": 1.6999547369778156e-07,
+    "t_eval_s": 0.0012826340025640093,
+    "t_total_s": 0.001282803998037707,
+    "t_per_pulse_ms": 0.06413170012820046
+  },
+  "speedup": 173.44905369251725
+}

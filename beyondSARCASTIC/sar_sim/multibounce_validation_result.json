@@ -1,0 +1,26 @@
+{
+  "footprint_m": 300.0,
+  "density_per_km2": 200.0,
+  "n_buildings": 18,
+  "n_pulses": 20,
+  "ground_material": "dry_soil",
+  "occlusion_check": true,
+  "path_counts": {
+    "sbr_order2_raytraced": 1070,
+    "asc_leg2_closed_form": 424,
+    "overcount_ratio": 0.39626168224299063,
+    "asc_aabb_blocked": 166
+  },
+  "image_scores": {
+    "ssim": 0.4839648896019608,
+    "amp_rms": 0.053621447610232915,
+    "phase_rms_deg": 126.74403885452924,
+    "phase_bias_deg": 78.90580203918535,
+    "phase_max_deg": 176.89017563069316,
+    "coherence": 0.17795093381069144
+  },
+  "timing": {
+    "sbr_ms_per_pulse": 562.0719487014867,
+    "asc_ms_per_pulse": 8.285124249960063
+  }
+}

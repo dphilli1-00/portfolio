@@ -1,0 +1,103 @@
+{
+  "assumptions": {
+    "rt_gigarays_per_sec": 10.0,
+    "t_fixed_s_per_pulse": 0.002,
+    "r_ansys_s_per_structure": 7.5e-05,
+    "r_tiered_s_per_structure": 5e-05,
+    "r_asc_s_per_structure": 5e-07,
+    "n_pulses_per_collect": 500
+  },
+  "rows": [
+    {
+      "scene": "Single trihedral (calibration target)",
+      "n_structures": 1,
+      "ansys_per_pulse_s": 0.002075,
+      "tiered_per_pulse_s": 0.00205,
+      "mypipeline_per_pulse_s": 0.0020005,
+      "speedup_ansys_vs_mypipeline": 1.037240689827543,
+      "speedup_ansys_vs_tiered": 1.0121951219512195,
+      "speedup_tiered_vs_mypipeline": 1.0247438140464884,
+      "ansys_per_500pulse_s": 1.0375,
+      "tiered_per_500pulse_s": 1.0250000000000001,
+      "mypipeline_per_500pulse_s": 1.00025
+    },
+    {
+      "scene": "Single vehicle / small target cluster",
+      "n_structures": 5,
+      "ansys_per_pulse_s": 0.002375,
+      "tiered_per_pulse_s": 0.0022500000000000003,
+      "mypipeline_per_pulse_s": 0.0020025,
+      "speedup_ansys_vs_mypipeline": 1.1860174781523096,
+      "speedup_ansys_vs_tiered": 1.0555555555555554,
+      "speedup_tiered_vs_mypipeline": 1.1235955056179776,
+      "ansys_per_500pulse_s": 1.1875,
+      "tiered_per_500pulse_s": 1.1250000000000002,
+      "mypipeline_per_500pulse_s": 1.00125
+    },
+    {
+      "scene": "City block (~25 structures)",
+      "n_structures": 25,
+      "ansys_per_pulse_s": 0.003875,
+      "tiered_per_pulse_s": 0.0032500000000000003,
+      "mypipeline_per_pulse_s": 0.0020125,
+      "speedup_ansys_vs_mypipeline": 1.9254658385093169,
+      "speedup_ansys_vs_tiered": 1.1923076923076923,
+      "speedup_tiered_vs_mypipeline": 1.6149068322981368,
+      "ansys_per_500pulse_s": 1.9375,
+      "tiered_per_500pulse_s": 1.6250000000000002,
+      "mypipeline_per_500pulse_s": 1.00625
+    },
+    {
+      "scene": "Small district (~125 structures)",
+      "n_structures": 125,
+      "ansys_per_pulse_s": 0.011375,
+      "tiered_per_pulse_s": 0.00825,
+      "mypipeline_per_pulse_s": 0.0020625,
+      "speedup_ansys_vs_mypipeline": 5.515151515151515,
+      "speedup_ansys_vs_tiered": 1.3787878787878787,
+      "speedup_tiered_vs_mypipeline": 4.0,
+      "ansys_per_500pulse_s": 5.6875,
+      "tiered_per_500pulse_s": 4.125,
+      "mypipeline_per_500pulse_s": 1.03125
+    },
+    {
+      "scene": "District (~625 structures)",
+      "n_structures": 625,
+      "ansys_per_pulse_s": 0.048874999999999995,
+      "tiered_per_pulse_s": 0.03325,
+      "mypipeline_per_pulse_s": 0.0023125,
+      "speedup_ansys_vs_mypipeline": 21.135135135135133,
+      "speedup_ansys_vs_tiered": 1.469924812030075,
+      "speedup_tiered_vs_mypipeline": 14.37837837837838,
+      "ansys_per_500pulse_s": 24.437499999999996,
+      "tiered_per_500pulse_s": 16.625,
+      "mypipeline_per_500pulse_s": 1.15625
+    },
+    {
+      "scene": "Large district (~3,125 structures)",
+      "n_structures": 3125,
+      "ansys_per_pulse_s": 0.23637499999999997,
+      "tiered_per_pulse_s": 0.15825,
+      "mypipeline_per_pulse_s": 0.0035624999999999997,
+      "speedup_ansys_vs_mypipeline": 66.35087719298245,
+      "speedup_ansys_vs_tiered": 1.4936808846761451,
+      "speedup_tiered_vs_mypipeline": 44.42105263157895,
+      "ansys_per_500pulse_s": 118.18749999999999,
+      "tiered_per_500pulse_s": 79.125,
+      "mypipeline_per_500pulse_s": 1.7812499999999998
+    },
+    {
+      "scene": "Full 10km x 10km city (~20,000 structures)",
+      "n_structures": 20000,
+      "ansys_per_pulse_s": 1.5019999999999998,
+      "tiered_per_pulse_s": 1.002,
+      "mypipeline_per_pulse_s": 0.012,
+      "speedup_ansys_vs_mypipeline": 125.16666666666664,
+      "speedup_ansys_vs_tiered": 1.499001996007984,
+      "speedup_tiered_vs_mypipeline": 83.5,
+      "ansys_per_500pulse_s": 750.9999999999999,
+      "tiered_per_500pulse_s": 501.0,
+      "mypipeline_per_500pulse_s": 6.0
+    }
+  ]
+}

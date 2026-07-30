@@ -1,0 +1,12 @@
+{
+  "n_facets": 800,
+  "n_buildings": 200,
+  "n_rays": 900,
+  "n_pulses": 20,
+  "n_freq": 64,
+  "footprint_m": 1000.0,
+  "t_intersect_s": 0.9220109979960398,
+  "t_phase_s": 0.024325375002263172,
+  "t_total_s": 0.946336372998303,
+  "t_per_pulse_ms": 47.31681864991515
+}
