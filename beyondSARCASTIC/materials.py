@@ -59,3 +59,61 @@ def fresnel_reflectivity(material: str, theta_i: np.ndarray) -> np.ndarray:
 
 def diffuse_coefficient(material: str) -> float:
     return DIFFUSE_COEFF[material]
+
+
+# RMS surface height (m), per material -- representative, not measured.
+# This is a DIFFERENT quantity from DIFFUSE_COEFF above: DIFFUSE_COEFF sets
+# how bright a purely-incoherent, isotropic point-scatterer background is
+# (used by make_ground_clutter for diffuse terrain); ROUGHNESS_SIGMA_M
+# governs how much of a smooth Fresnel reflection off an actual traced
+# FACET survives as a coherent, specular (forward-scattering) return
+# rather than being scattered away -- only meaningful for something ray
+# tracing can bounce off of (e.g. multibounce_demo's ground facet), not
+# for the diffuse point-scatterer layer, which has no facet/normal to
+# even define a specular direction against.
+ROUGHNESS_SIGMA_M = {
+    "dry_soil": 0.012,   # ~1.2cm rms height -- tilled/bare soil, not smooth
+    "concrete": 0.0015,  # ~1.5mm rms height -- finished concrete/pavement
+    "metal": 0.0002,     # optically smooth at radar wavelengths
+}
+
+
+def specular_scatter_factor(material: str, theta_i: np.ndarray, wavelength: float) -> np.ndarray:
+    """
+    Modified-Rayleigh coherent-scattering factor: the fraction of the bare
+    Fresnel-reflected energy that stays in the coherent, specular
+    (forward-scatter / mirror) direction, versus being diffusely
+    scattered away in random directions, given the surface's RMS height
+    roughness relative to wavelength AND local incidence angle:
+
+        rho = exp( -(4*pi*sigma*cos(theta_i) / wavelength)^2 )
+
+    rho -> 1: this surface, at this incidence angle and wavelength,
+    behaves like a coherent mirror -- the full Fresnel reflectivity is
+    available to a specular ray-traced bounce path (e.g. the ground leg
+    of a wall-ground dihedral).
+    rho -> 0: the surface is rough relative to wavelength at this
+    incidence angle -- most of the energy is incoherently scattered in
+    directions a specular ray trace can't represent, so a coherent
+    multi-bounce path through this facet should contribute close to
+    nothing here, even though fresnel_reflectivity() for the bare
+    material is unchanged.
+
+    Deliberately angle-dependent (cos(theta_i) in the exponent): the SAME
+    rough surface looks smoother at grazing incidence than near-normal
+    incidence -- this is the real, well-known angle dependence of the
+    Rayleigh roughness criterion (referenced conceptually on the deck's
+    Step 1 slide), not a convenience simplification.
+    """
+    sigma = ROUGHNESS_SIGMA_M[material]
+    return np.exp(-((4.0 * np.pi * sigma * np.cos(theta_i)) / wavelength) ** 2)
+
+
+def effective_specular_reflectivity(material: str, theta_i: np.ndarray, wavelength: float) -> np.ndarray:
+    """fresnel_reflectivity() alone answers 'how reflective is this
+    material'; multiplying by specular_scatter_factor() answers the
+    question that actually matters for a ray-traced specular bounce:
+    'how much of that reflection survives as a coherent forward-scatter
+    return, at this specific angle/wavelength/roughness, instead of
+    being lost to diffuse scattering'."""
+    return fresnel_reflectivity(material, theta_i) * specular_scatter_factor(material, theta_i, wavelength)

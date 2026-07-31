@@ -125,13 +125,74 @@ def make_building_scene(xp, footprint_m, density_per_km2, seed=0,
     )
 
 
+def make_ground_facet(xp, footprint_m, margin_m=0.0, material='dry_soil'):
+    """
+    One large flat facet at z=0, normal +z, spanning the scene footprint
+    (+ margin) -- a ray-traceable ground plane.
+
+    This is NOT the same thing as make_ground_clutter()'s diffuse
+    point-scatterer background. That layer models incoherent, isotropic
+    bare-earth texture (concrete's Rayleigh-scale diffuse coefficient,
+    ~0.03) and deliberately has no facet/normal/occlusion behavior at all
+    -- it's added identically to both the dense-SBR and ASC-cached
+    branches specifically so it does NOT touch the SBR-vs-ASC comparison.
+    This ground facet is the opposite: a single coherent, specular
+    reflector that ray tracing can actually bounce off of, needed only so
+    a wall-ground dihedral (or wall-ground-wall trihedral) path has
+    something to close the loop against.
+
+    The 'amp' field here is a PLACEHOLDER (1.0) -- unlike building facets,
+    where amp is baked in once at scene-build time, the ground's actual
+    contribution to a multi-bounce path is angle- and wavelength-dependent
+    (materials.effective_specular_reflectivity: Fresnel reflectivity for
+    `material`, scaled down by how much of that reflection survives as a
+    coherent specular return vs. being lost to diffuse scattering, given
+    the material's roughness at the LOCAL incidence angle of that specific
+    bounce). multibounce_demo._score_paths computes that value per-path,
+    per-bounce, and substitutes it in place of this placeholder wherever a
+    bounce lands on the ground facet -- see materials.py and
+    multibounce_demo.py's _score_paths docstring for why a fixed scalar
+    here would be physically wrong regardless of what number was chosen.
+
+    Used only by the multi-bounce tracer (bounce order >= 2); the existing
+    single-bounce dense-SBR path never sees this facet, so Tier 2's
+    already-validated single-bounce numbers are unaffected.
+    """
+    half = footprint_m / 2.0 + margin_m
+    to_xp = lambda a: xp.asarray(np.array(a, dtype=np.float64))
+    return dict(
+        center=to_xp([[0.0, 0.0, 0.0]]), u_hat=to_xp([[1.0, 0.0, 0.0]]),
+        v_hat=to_xp([[0.0, 1.0, 0.0]]), normal=to_xp([[0.0, 0.0, 1.0]]),
+        half_u=to_xp([half]), half_v=to_xp([half]), amp=to_xp([1.0]),
+        material=material,
+    )
+
+
+def concat_facets(xp, *facet_dicts):
+    """Concatenate two or more facets dicts (e.g. buildings + ground) into
+    one combined array set, for tracing bounces against the union of both.
+    Only combines the (F,3)/(F,) geometric arrays -- not the per-building
+    metadata (building_cx/cy/w/d/h), which callers doing per-building
+    analysis should keep reading from the original buildings-only dict."""
+    keys = ['center', 'u_hat', 'v_hat', 'normal', 'half_u', 'half_v', 'amp']
+    return {k: xp.concatenate([fd[k] for fd in facet_dicts], axis=0) for k in keys}
+
+
 # ----------------------------------------------------------------------
 # Dense SBR: cast rays, test every ray against every facet, keep nearest hit
 # ----------------------------------------------------------------------
 def _ray_facet_intersect_chunk(xp, ray_o, ray_d, facets):
     """Un-chunked core: same math as before, called per chunk by
     ray_facet_intersect. Do not call directly with large R*F -- see that
-    function's docstring for why."""
+    function's docstring for why.
+
+    ray_o is (R,3) here (per-ray origin) -- generalized from the original
+    single-origin (3,) version so bounce>=2 rays (which each start at a
+    different hit point from the previous bounce, not a shared platform
+    position) can reuse this exact intersection core instead of a second
+    copy of the math. Single-origin callers broadcast to (R,3) once in
+    ray_facet_intersect before chunking; this function no longer cares
+    which case it's in."""
     C_ = facets['center']       # (F,3)
     N_ = facets['normal']       # (F,3)
     U_ = facets['u_hat']        # (F,3)
@@ -143,11 +204,12 @@ def _ray_facet_intersect_chunk(xp, ray_o, ray_d, facets):
     denom = ray_d @ N_.T                       # (R,F)  d . n
     valid_denom = xp.abs(denom) > 1e-8
 
-    # (F,) numerator: (C_f - O) . N_f -- same for every ray, only depends on facet
-    num_f = xp.sum((C_ - ray_o[None, :]) * N_, axis=1)   # (F,)
-    t = num_f[None, :] / xp.where(valid_denom, denom, xp.inf)   # (R,F)
+    # (R,F) numerator: (C_f - O_r) . N_f -- per-ray now, not shared across
+    # rays, since each ray may start from a different origin
+    num = xp.sum((C_[None, :, :] - ray_o[:, None, :]) * N_[None, :, :], axis=2)   # (R,F)
+    t = num / xp.where(valid_denom, denom, xp.inf)   # (R,F)
 
-    hit_pt = ray_o[None, None, :] + t[:, :, None] * ray_d[:, None, :]   # (R,F,3)
+    hit_pt = ray_o[:, None, :] + t[:, :, None] * ray_d[:, None, :]   # (R,F,3)
     rel = hit_pt - C_[None, :, :]                                       # (R,F,3)
     a = xp.sum(rel * U_[None, :, :], axis=2)   # (R,F) local u-coord
     b = xp.sum(rel * V_[None, :, :], axis=2)   # (R,F) local v-coord
@@ -164,7 +226,13 @@ def _ray_facet_intersect_chunk(xp, ray_o, ray_d, facets):
     # ASC-cached didn't have, at exactly the same range bin for every
     # building -- too consistent to be noise.
     front_face = denom < 0
-    valid = valid_denom & in_bounds & (t > 0) & front_face
+    # t > 1e-6, not t > 0: bounce>=2 rays start exactly ON the facet they
+    # just left (offset a small epsilon along the normal at the call site,
+    # but floating-point residue can still land t right at ~0) -- a bare
+    # t > 0 threshold let those rays immediately "re-hit" their own facet
+    # of origin. 1e-6 is negligible at this scene's meter-to-kilometer
+    # scale but clears that self-intersection.
+    valid = valid_denom & in_bounds & (t > 1e-6) & front_face
     t_masked = xp.where(valid, t, xp.inf)
 
     nearest_idx = xp.argmin(t_masked, axis=1)          # (R,)
@@ -175,16 +243,20 @@ def _ray_facet_intersect_chunk(xp, ray_o, ray_d, facets):
     hit_amp = AMP[nearest_idx]
     hit_normal = N_[nearest_idx]
     cos_inc = xp.abs(xp.sum(-ray_d * hit_normal, axis=1))   # (R,)
-    hit_point = ray_o[None, :] + xp.where(hit_mask, nearest_t, 0.0)[:, None] * ray_d
+    hit_point = ray_o + xp.where(hit_mask, nearest_t, 0.0)[:, None] * ray_d
 
     return hit_point, hit_amp, cos_inc, hit_mask, nearest_idx
 
 
 def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000):
     """
-    ray_o: (3,)  single platform position for this pulse
+    ray_o: (3,) a single shared origin (e.g. platform position for this
+        pulse -- the bounce-1 case), OR (R,3) a per-ray origin (bounce>=2,
+        where every ray starts at its own previous-bounce hit point).
+        A (3,) input is broadcast to (R,3) once here.
     ray_d: (R,3) ray directions (normalized)
-    facets: dict of (F,3)/(F,) arrays from make_building_scene
+    facets: dict of (F,3)/(F,) arrays from make_building_scene (or a
+        concat_facets(...) combination, e.g. buildings + ground)
 
     Returns: hit_point (R,3), hit_amp (R,), hit_cos (R,), hit_mask (R,) bool,
     nearest_idx (R,) int -- facet index each ray landed on (only meaningful
@@ -212,6 +284,9 @@ def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000):
     R = ray_d.shape[0]
     F = facets['center'].shape[0]
 
+    if ray_o.ndim == 1:
+        ray_o = xp.broadcast_to(ray_o[None, :], ray_d.shape)
+
     bytes_per_ray_row = F * 3 * 8    # the (chunk, F, 3) float64 arrays dominate
     chunk_size = max(1, int(max_chunk_bytes / max(bytes_per_ray_row, 1)))
 
@@ -221,7 +296,8 @@ def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000):
     hit_points, hit_amps, cos_incs, hit_masks, nearest_idxs = [], [], [], [], []
     for start in range(0, R, chunk_size):
         d_chunk = ray_d[start:start + chunk_size]
-        hp, ha, ci, hm, ni = _ray_facet_intersect_chunk(xp, ray_o, d_chunk, facets)
+        o_chunk = ray_o[start:start + chunk_size]
+        hp, ha, ci, hm, ni = _ray_facet_intersect_chunk(xp, o_chunk, d_chunk, facets)
         hit_points.append(hp)
         hit_amps.append(ha)
         cos_incs.append(ci)

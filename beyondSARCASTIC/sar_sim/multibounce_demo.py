@@ -77,6 +77,12 @@ import time
 import json
 import numpy as np
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):   # no-op fallback if tqdm isn't installed
+        return iterable
+
 from dense_sbr_demo import (make_building_scene, make_ground_facet, concat_facets,
                              ray_facet_intersect, get_backend, make_aim_grid, C)
 from materials import effective_specular_reflectivity
@@ -552,7 +558,7 @@ def _score_paths(xp, o, ref_pos, freqs, level_idxs, level_centers, level_normals
 
 
 def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_pts, freqs, ref_pos,
-                         max_bounces=3, eps=1e-3, return_components=False):
+                         max_bounces=3, eps=1e-3, return_components=False, progress=False):
     """
     return_components: when True, stats['s_by_order'] additionally holds
     the PER-ORDER phase histories (order1/order2/order3, each (n_pulses,K))
@@ -562,6 +568,12 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
     single-bounce agreement, the same "whole-image SSIM is diluted"
     lesson the Tier 2 validation slide already learned for per-building
     scoring vs. whole-image scoring.
+
+    progress: show a tqdm bar over the per-pulse loop (elapsed/ETA/it-per-sec
+    for free, plus running order1/2/3 counts in the postfix) -- this loop
+    otherwise gives zero feedback until it returns, which is a bad time on
+    a multi-hour dense-scene run. Falls back to a no-op if tqdm isn't
+    installed. False (default) prints nothing, same as before.
     """
     n_pulses = plat.shape[0]
     K = freqs.shape[0]
@@ -591,7 +603,8 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
                            order2=xp.zeros((n_pulses, K), dtype=xp.complex128),
                            order3=xp.zeros((n_pulses, K), dtype=xp.complex128))
 
-    for p in range(n_pulses):
+    pbar = tqdm(range(n_pulses), desc="SBR pulses", disable=not progress)
+    for p in pbar:
         o = plat[p]
         d1 = aim_pts - o[None, :]
         d1 = d1 / xp.linalg.norm(d1, axis=1, keepdims=True)
@@ -697,6 +710,9 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
         if on_gpu:
             xp.cuda.Stream.null.synchronize()
         t_total += (time.perf_counter() - t0)
+
+        if progress:
+            pbar.set_postfix(counts, refresh=False)
 
     stats = dict(counts=counts, t_total_s=t_total,
                  t_per_pulse_ms=t_total / n_pulses * 1000.0,

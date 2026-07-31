@@ -31,7 +31,6 @@ from dense_sbr_demo import (make_building_scene, get_backend, C, make_aim_grid,
                              compute_layover_margin)
 from sbr_vs_asc_compare import run_dense_sbr_timed, run_asc_cached
 
-plt.close("all")
 
 def backproject(xp, s, plat_pos, freqs, grid_x, grid_y, fc, R_ref):
     """Time-domain backprojection, backend-agnostic (numpy or cupy).
@@ -573,19 +572,19 @@ def main():
     # ---- Separate figure: phase/coherence, on its own since it answers a
     # different question (does phase agree spatially, not just does the
     # image look the same) and was crowding the main 4-panel comparison. ----
-    fig2, ax2 = plt.subplots(1, 4, figsize=(19, 5.2))
+    fig2, ax2 = plt.subplots(2, 2, figsize=(13, 11))
 
     # Spatially-resolved coherence map -- reveals WHERE disagreement lives,
     # not just one averaged-away number. Clutter is added identically to
     # both branches, so background should read near-1; low coherence should
     # be localized at buildings if compression fidelity is the real story.
     coh_map = coherence_map(img_sbr, img_asc, win=7)
-    im3 = ax2[0].imshow(coh_map, cmap='viridis', vmin=0, vmax=1, origin='lower',
+    im3 = ax2[0, 0].imshow(coh_map, cmap='viridis', vmin=0, vmax=1, origin='lower',
                             extent=[-args.footprint/2, args.footprint/2]*2)
-    ax2[0].set_title(f'Coherence map (7x7 window)\nwhole-image coherence={coherence:.3f}')
-    ax2[0].set_xlabel('cross-range (m)')
-    ax2[0].set_ylabel('range (m)')
-    plt.colorbar(im3, ax=ax2[0], fraction=0.046)
+    ax2[0, 0].set_title(f'Coherence map (7x7 window)\nwhole-image coherence={coherence:.3f}')
+    ax2[0, 0].set_xlabel('cross-range (m)')
+    ax2[0, 0].set_ylabel('range (m)')
+    plt.colorbar(im3, ax=ax2[0, 0], fraction=0.046)
 
     # Spatial phase-difference map, magnitude-masked -- dphase is already a
     # full (img_size, img_size) array (computed above for the whole-image
@@ -594,30 +593,30 @@ def main():
     # phase by construction) don't wash out the real disagreement visually.
     dphase_deg = np.degrees(dphase)
     dphase_masked = np.where(sig_mask_whole, dphase_deg, np.nan)
-    im4 = ax2[1].imshow(dphase_masked, cmap='twilight_shifted', vmin=-20, vmax=20, origin='lower',
+    im4 = ax2[0, 1].imshow(dphase_masked, cmap='twilight_shifted', vmin=-20, vmax=20, origin='lower',
                             extent=[-args.footprint/2, args.footprint/2]*2)
-    ax2[1].set_title(f'Phase difference (deg), masked to >5% peak\n'
+    ax2[0, 1].set_title(f'Phase difference (deg), masked to >5% peak\n'
                          f'bias={np.degrees(phase_bias):+.2f}deg, RMS={np.degrees(phase_rms):.2f}deg')
-    ax2[1].set_xlabel('cross-range (m)')
-    ax2[1].set_ylabel('range (m)')
-    plt.colorbar(im4, ax=ax2[1], fraction=0.046, label='deg')
+    ax2[0, 1].set_xlabel('cross-range (m)')
+    ax2[0, 1].set_ylabel('range (m)')
+    plt.colorbar(im4, ax=ax2[0, 1], fraction=0.046, label='deg')
 
     if len(scored) > 0:
         heights = np.array([r['height_m'] for r in scored])
-        sc = ax2[3].scatter(b_ssim, b_coherence, c=heights, cmap='viridis', s=26, edgecolor='k', linewidth=0.3)
+        sc = ax2[1, 0].scatter(b_ssim, b_coherence, c=heights, cmap='viridis', s=26, edgecolor='k', linewidth=0.3)
         lo = min(b_ssim.min(), b_coherence.min()) - 0.01
-        ax2[3].plot([lo, 1], [lo, 1], 'k--', linewidth=0.8, label='y=x')
-        ax2[3].set_xlabel('SSIM')
-        ax2[3].set_ylabel('coherence')
-        ax2[3].set_title('Per-building: SSIM vs. coherence\n(color = building height)')
-        ax2[3].legend(fontsize=8)
-        plt.colorbar(sc, ax=ax2[3], fraction=0.046, label='height (m)')
+        ax2[1, 0].plot([lo, 1], [lo, 1], 'k--', linewidth=0.8, label='y=x')
+        ax2[1, 0].set_xlabel('SSIM')
+        ax2[1, 0].set_ylabel('coherence')
+        ax2[1, 0].set_title('Per-building: SSIM vs. coherence\n(color = building height)')
+        ax2[1, 0].legend(fontsize=8)
+        plt.colorbar(sc, ax=ax2[1, 0], fraction=0.046, label='height (m)')
 
-        ax2[2].hist(b_phase_rms, bins=min(20, max(5, len(scored)//3)), color='#B85C00', edgecolor='white')
-        ax2[2].set_title(f'Per-building phase RMS\nmean={b_phase_rms.mean():.2f}deg, '
+        ax2[1, 1].hist(b_phase_rms, bins=min(20, max(5, len(scored)//3)), color='#B85C00', edgecolor='white')
+        ax2[1, 1].set_title(f'Per-building phase RMS\nmean={b_phase_rms.mean():.2f}deg, '
                              f'max={b_phase_rms.max():.2f}deg')
-        ax2[2].set_xlabel('phase RMS (deg)')
-        ax2[2].set_ylabel('buildings')
+        ax2[1, 1].set_xlabel('phase RMS (deg)')
+        ax2[1, 1].set_ylabel('buildings')
     else:
         ax2[1, 0].text(0.5, 0.5, 'no buildings scored', ha='center', va='center')
         ax2[1, 1].text(0.5, 0.5, 'no buildings scored', ha='center', va='center')
