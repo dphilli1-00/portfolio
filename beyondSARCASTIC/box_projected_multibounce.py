@@ -26,6 +26,13 @@ import time
 import numpy as np
 from materials import effective_specular_reflectivity
 from multibounce_demo import _azimuth_sinc_taper
+from trihedral_asc_closed_form import asc_visible_envelope
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):   # no-op fallback if tqdm isn't installed
+        return iterable
 
 C = 299792458.0
 
@@ -131,6 +138,32 @@ def _reflect_and_intersect_scene(xp, C_bounce, N_bounce, d_in, ground_half_exten
                 is_ground=is_ground, is_roof_hit=is_roof_hit, surf_normal=surf_normal)
 
 
+def _segment_occluded_by_any_box(xp, seg_start, seg_dir, seg_len, box_min, box_max, exclude_ids_list):
+    """AABB-only occlusion test for the FINITE segment [seg_start, seg_start
+    + seg_len*seg_dir] (e.g. the leg-2 hop from facet C to hit point G):
+    True where some OTHER building's box intersects the open segment before
+    it reaches its own endpoint, i.e. would have blocked a real ray along
+    this path. exclude_ids_list: buildings to NOT count as occluders for
+    this segment (its own source building, and the building it's aiming
+    at -- the segment legitimately touches that box's surface at t~seg_len,
+    which isn't occlusion, it's the destination). Box-only, not facet-level
+    -- cheaper than a full ray_facet_intersect pass, same complexity class
+    (O(F x n_buildings)) as the rest of this module; good enough to test
+    whether occlusion is the real cause of the leg2 coherence collapse
+    before paying for anything more precise."""
+    t_enter = ray_box_intersect(xp, seg_start, seg_dir, box_min, box_max)   # (N, M)
+    N = seg_start.shape[0]
+    rows = xp.arange(N)
+    t_enter = t_enter.copy()
+    for excl in exclude_ids_list:
+        valid_excl = excl >= 0
+        safe = xp.where(valid_excl, excl, 0)
+        cur = t_enter[rows, safe]
+        t_enter[rows, safe] = xp.where(valid_excl, xp.inf, cur)
+    blocked = t_enter < (seg_len[:, None] - 1e-6)
+    return xp.any(blocked, axis=1)
+
+
 def _building_boxes_from_facets(xp, facets_buildings):
     """box_min/box_max per building (n_buildings,3), built straight from
     the host-side building_cx/cy/w/d/h metadata -- NOT multibounce_demo's
@@ -147,18 +180,172 @@ def _building_boxes_from_facets(xp, facets_buildings):
     return box_min, box_max
 
 
-def _azimuth_sinc_taper_local(xp, wavelength, L, n_xy, look_xy):
-    return _azimuth_sinc_taper(xp, wavelength, L, n_xy, look_xy)
+def _azimuth_sinc_taper_local(xp, wavelength, L, normal, u_hat, look_dir):
+    return _azimuth_sinc_taper(xp, wavelength, L, normal, u_hat, look_dir)
 
 
 def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat, freqs, ref_pos,
-                                       ground_material=None, return_components=False, include_order3=False):
+                                       ground_material=None, return_components=False, include_order3=False,
+                                       progress=False, low_precision_envelope=False, free_pool_every=None,
+                                       leg2_occlusion_check=False, split_leg2_by_target=False,
+                                       leg2_retroreflection_check=False, retro_beamwidth_mult=3.0,
+                                       leg2_building_enabled=True, leg2_retro_taper=False):
     """Same leg-1 as run_asc_cached_multibounce (sensor->facet, closed
     form, unchanged). Leg 2 now targets whichever is nearer of {ground
     plane, any OTHER building's box} instead of always the ground --
     the fix for the scope gap compare_ground_points.py found (SBR's real
     order-2 bucket includes wall-to-wall bounces this couldn't represent
     before).
+
+    progress: tqdm bar over the per-pulse loop (elapsed/ETA/it-per-sec,
+    plus running leg1/2/3 valid-facet counts in the postfix) -- same
+    convention as run_multibounce_sbr's progress flag. Added because this
+    loop is O(facets x buildings) per pulse (module docstring) with NO
+    per-pulse feedback otherwise: on a big scene (tens of thousands of
+    facets, tens of buildings) this can legitimately run for many minutes
+    with nothing printed, indistinguishable from a hang without this.
+    False (default) prints nothing, same as before.
+
+    low_precision_envelope: passed through to asc_amplitude_envelope's
+    own low_precision flag (see its docstring) -- float32/complex64 for
+    the envelope computation instead of float64/complex128, halving the
+    single largest per-pulse array at real-scene scale. Opt-in, default
+    False: this codebase's canonical-shape validation coherence numbers
+    were all measured at float64 and haven't been re-checked at float32,
+    so this isn't a verified-safe default, just an available tradeoff.
+
+    leg2_retro_taper: default False. This supersedes leg2_retroreflection_check
+    as the real fix -- that binary gate measurably helped wall->building
+    (leg2_building coherence 0.06->0.63 at 500m) but had ZERO effect on
+    wall->ground (0.0991 unchanged before/after gating at 500m, 0.0562 ->
+    0.0561 at 1000m), which is the tell that a hard yes/no cutoff is the
+    wrong shape of fix, not that ground has no problem.
+
+    Root cause, found by actually reading how leg1/leg2 share their
+    envelope: box_projected_multibounce's chunked combine loop computes
+    ONE envelope per facet-chunk (asc_visible_envelope, using L_az=L_wall,
+    u_hat=Ub -- the WALL's own azimuth persistence/illumination taper) and
+    reuses it UNCHANGED for both leg1_contrib and leg2_contrib. That's
+    correct for leg1 (a single facet's own reflectivity really does vary
+    with viewing angle relative to its own axis) but wrong for leg2: a
+    dihedral corner's return strength is a property of the WHOLE two-
+    bounce path's alignment with the narrow retroreflective geometry, not
+    of the source facet's own illumination. Leg2 currently has NO
+    persistence taper of its own at all -- every geometrically-findable
+    wall-target pair contributes at essentially full strength regardless
+    of how far the actual double-bounce path is from the narrow angular
+    region where a real corner returns coherently. That is the over-
+    counted "diffuse clutter floor instead of a few sharp corners"
+    pattern visible in the backprojected leg2 images.
+
+    When True: computes the same second-bounce misalignment angle
+    leg2_retroreflection_check uses (true specular return direction vs.
+    actual direction to the sensor), but instead of a hard cutoff, applies
+    it as a continuous, frequency-dependent sinc taper --
+    sinc(2*pi*f*L_wall*sin(misalignment)/c) -- the SAME mathematical form
+    already validated for leg1's own taper (asc_amplitude_envelope), just
+    pointed at the corner's own misalignment angle instead of the wall's
+    illumination angle. Applied multiplicatively on top of (not instead
+    of) the existing envelope, inside the chunked combine loop. Can be
+    combined with leg2_retroreflection_check (belt-and-suspenders: hard
+    floor plus graceful falloff) or used alone.
+
+    leg2_building_enabled: default True. Opt-out comparison: when False,
+    leg2 targets ONLY the ground (is_ground) -- wall->building candidates
+    are dropped entirely, falling back to the originally-validated
+    ground-only leg2 case. Added because even WITH
+    leg2_retroreflection_check=True, leg2_building's own coherence vs SBR
+    order2 stayed poor at the 1000m/200-building scale (0.045, barely
+    above leg2_ground's 0.056) while the COMBINED coherence improvement
+    there was better explained by leg2's total energy shrinking (fewer
+    contributing terms diluting a still-low-correlation signal) than by
+    building-target leg2 becoming genuinely more correct. Worth checking
+    whether leg1 + leg2_ground alone matches or beats leg1 + leg2 (retro-
+    gated) -- if so, the wall-to-building generalization isn't earning its
+    complexity at this density and a simpler ground-only fallback may be
+    the more defensible fix.
+
+    leg2_retroreflection_check: default False. This is the fix, not just
+    another ablation -- both occlusion checks (C->G, then G->o) left
+    leg2's coherence vs SBR order2 completely unchanged, and the
+    split_leg2_by_target diagnostic then showed WHY: on the 500m scene,
+    wall->building bounces are only ~10% of leg2's event count but 99.8%
+    of its ENERGY, and their coherence with order2 (0.06) is nearly as bad
+    as leg2 combined -- a small number of "coincidentally nearest"
+    building pairs are producing large, SBR-uncorrelated returns.
+
+    The root cause: this function's whole approach (sum three segment
+    lengths, treat the total as one coherent monostatic path) is only
+    EXACT for a true 90-degree corner -- a vertical wall meeting flat
+    ground is retroreflective by geometric identity, for any incidence
+    angle, which is why the original ground-only leg2 never needed to
+    verify the return path explicitly. Generalizing the TARGET SEARCH to
+    "nearest of ground or any building" (this module's whole point) did
+    NOT generalize the PHYSICS -- an arbitrary building pair generally
+    does not meet at 90 degrees, so there's no guarantee the second
+    surface's own law of reflection sends the ray back toward the sensor.
+    Every nearest-box pair still gets scored as if it were a valid corner.
+
+    When True: computes the TRUE second-bounce specular direction (mirror-
+    reflecting d_out off the target surface's own normal, not assuming
+    it retroreflects), compares it against the actual direction from G to
+    the sensor, and zeros amp_eff2_geom wherever the misalignment angle
+    exceeds retro_beamwidth_mult * (wavelength / L_wall) -- a diffraction-
+    limited tolerance built from the SAME source-facet width (L_wall)
+    already used for this codebase's azimuth sinc taper elsewhere (an
+    approximation, not a rigorous two-bounce Fresnel-zone derivation, but
+    consistent with how this codebase already treats angular sensitivity
+    around a specular peak). For a true wall-ground corner this is exactly
+    satisfied (retro angle ~0) regardless of L_wall, so ground-target leg2
+    should pass through this gate essentially unchanged; wall-to-building
+    pairs that don't happen to form a near-90-degree corner should mostly
+    get suppressed. retro_beamwidth_mult: how many beamwidths of
+    misalignment tolerance to allow (wider = more permissive gate).
+
+    split_leg2_by_target: default False. Opt-in diagnostic (task #44/#45
+    investigation) that, when return_components=True, additionally returns
+    s_by_leg['leg2_ground'] and s_by_leg['leg2_building'] -- leg2 split by
+    whether _reflect_and_intersect_scene's winning target was the ground
+    plane (a true 90-degree wall-ground dihedral, retroreflective by
+    geometric identity -- this function's "assume a coherent direct
+    return" approximation is EXACT there) vs another building's box (an
+    arbitrary building pair generally does NOT meet at 90 degrees, so
+    there's no guarantee the target surface's own law of reflection sends
+    the ray back toward the sensor -- nothing here checks that, every
+    nearest-box pair gets scored as if it were a valid corner regardless).
+    counts['leg2_ground'] / counts['leg2_building'] are populated too. Both
+    occlusion ablations above (leg2_occlusion_check on C->G, then on the
+    return leg) left leg2's ~0.02 coherence vs SBR order2 completely
+    unchanged -- this split exists to test the leading remaining
+    hypothesis (missing retroreflection validity, not occlusion) instead
+    of continuing to guess.
+
+    leg2_occlusion_check: default False. Opt-in ablation added to test why
+    decompose_sbr_asc_coherence.py found leg2 raw coherence vs SBR order2
+    collapsing to ~0.02 (essentially decorrelated) on the 1000m/200-
+    building scene, despite leg1 staying at ~0.93.
+
+    First attempt at this (now removed) tested the C->G outbound hop for
+    occlusion by other buildings' boxes and found it was a complete no-op
+    -- zero facets pruned, identical coherence. That's not a bug: G is
+    chosen by _reflect_and_intersect_scene's own argmin over {ground, all
+    OTHER buildings' boxes}, i.e. G is BY CONSTRUCTION the first thing the
+    outgoing ray hits. Nothing can occlude C->G that argmin wouldn't
+    already have picked as the (nearer) winner instead.
+
+    The segment that was never checked at all is the RETURN leg, G back
+    up to the sensor at o: after bouncing off a low wall or the ground,
+    does the path back to a distant, elevated platform clear every OTHER
+    building, or does something else in a dense field stand in the way?
+    Nothing in this function's pre-existing geometry answers that -- the
+    phase/range term (L_total) assumes a clear line regardless. When
+    leg2_occlusion_check=True, this does a cheap AABB-only test
+    (_segment_occluded_by_any_box) on G->o against every building's box
+    (excluding only building_hit itself, since G sits ON that box's
+    surface and would otherwise self-intersect at t~0) and zeros
+    amp_eff2_geom wherever blocked. Box-level, not facet-level -- cheaper
+    than real ray tracing, same O(F x n_buildings) complexity as the rest
+    of this module.
 
     include_order3=True adds a genuine third bounce: from the leg-2 hit
     point G2, reflect the outgoing direction off G2's OWN surface normal
@@ -168,14 +355,36 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
     original source building and (if leg2 hit one) that building too.
     Same complexity class as leg2 -- still O(facets x buildings) per
     pulse, one more hop, no ray tracing. Only candidates that were
-    already valid2 (a real leg-2 path) are extended to leg3."""
+    already valid2 (a real leg-2 path) are extended to leg3.
+
+    free_pool_every: on_gpu only -- call cupy's
+    get_default_memory_pool().free_all_blocks() every this-many pulses.
+    Default None (disabled). Originally added as a hypothesis-driven fix
+    for cupy memory-pool fragmentation (varying per-pulse allocation
+    sizes as the visible-facet count shifts pulse to pulse), mirroring a
+    real fragmentation-driven OOM already fixed once between the SBR and
+    closed-form stages elsewhere in this pipeline. BUT: when actually
+    tested live (this session), the hypothesis was directly REFUTED --
+    pool_mb (used/total) was measured IDENTICAL between two consecutive
+    pulses while iteration time still grew, meaning fragmentation was
+    not, in fact, what was happening in that run. The real cause turned
+    out to be a completely different problem (asc_visible_envelope's
+    sparse gather/scatter path, see task #38/#39). Left available and
+    off by default rather than deleted, because periodic freeing isn't
+    WRONG, just unproven and not free (each free forces the next
+    allocation to re-request memory from the driver instead of hitting
+    the pool, a real cost) -- don't turn this back on without your own
+    pool_mb evidence that fragmentation is actually growing in your
+    specific run; the postfix instrumentation below will show you."""
     n_pulses = plat.shape[0]
     K = freqs.shape[0]
 
     Cb, Nb, Ab = facets_buildings['center'], facets_buildings['normal'], facets_buildings['amp']
+    Ub = facets_buildings['u_hat']
     L_wall = 2.0 * facets_buildings['half_u']
     normal_xy = Nb[:, :2]
     fbid = facets_buildings['facet_building_id']
+    F = Cb.shape[0]
 
     half_extent_g = float(facets_ground.get('footprint_half_extent', 50.0))
     if ground_material is None:
@@ -201,9 +410,14 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
                          leg2=xp.zeros((n_pulses, K), dtype=xp.complex128))
         if include_order3:
             s_by_leg['leg3'] = xp.zeros((n_pulses, K), dtype=xp.complex128)
+        if split_leg2_by_target:
+            s_by_leg['leg2_ground'] = xp.zeros((n_pulses, K), dtype=xp.complex128)
+            s_by_leg['leg2_building'] = xp.zeros((n_pulses, K), dtype=xp.complex128)
 
     t_total = 0.0
-    for p in range(n_pulses):
+    counts = dict(leg1=0, leg2=0, leg3=0)
+    pbar = tqdm(range(n_pulses), desc="ASC pulses", disable=not progress)
+    for p in pbar:
         t0 = time.perf_counter()
         o = plat[p]
         R_ref = xp.linalg.norm(o - ref_pos)
@@ -213,15 +427,15 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         d_in = look / R_asc[:, None]
         cos_inc1 = xp.sum(-d_in * Nb, axis=1)
         visible1 = cos_inc1 > 0
-        taper1 = _azimuth_sinc_taper(xp, wavelength, L_wall, normal_xy, -d_in[:, :2])
-        amp_eff1 = xp.where(visible1, Ab * xp.abs(cos_inc1) * taper1, 0.0)
 
+        # amp_eff1_geom / dR1: real, (F,)-scale, cheap regardless of scene
+        # size -- alpha=1.0 (canonical GTD flat-plate/dihedral/trihedral
+        # value, Potter & Moses 1996), L_el=0 (validated for a wall-ground
+        # corner, task #32, 0.971 vs 0.44 coherence) drive the actual
+        # envelope, computed per facet-chunk below, not here.
+        amp_eff1_geom = xp.where(visible1, Ab * xp.abs(cos_inc1), 0.0)   # (F,) real, taper in env (below)
         dR1 = R_asc - R_ref
-        phase1 = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR1) / C)
-        leg1_contrib = (amp_eff1[None, :] * phase1).sum(axis=1)
-        s[p, :] += leg1_contrib
-        if return_components:
-            s_by_leg['leg1'][p, :] = leg1_contrib
+        counts['leg1'] += int(to_numpy(xp, visible1).sum())
 
         hit = _reflect_and_intersect_scene(xp, Cb, Nb, d_in, half_extent_g, box_min, box_max, fbid)
         G, valid_geom2, d_out = hit['G'], hit['valid'], hit['d_out']
@@ -229,6 +443,8 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
 
         cos_ground = xp.abs(xp.sum(d_out * surf_normal, axis=1))
         valid2 = visible1 & valid_geom2
+        if not leg2_building_enabled:
+            valid2 = valid2 & is_ground
 
         theta2 = xp.arccos(xp.clip(cos_ground, 0.0, 1.0))
         R_eff_ground = xp.asarray(effective_specular_reflectivity(ground_material, to_numpy(xp, theta2), wavelength))
@@ -238,16 +454,56 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         R_eff2 = xp.where(is_ground, R_eff_ground, R_eff_building)
 
         leg2_len = xp.linalg.norm(G - Cb, axis=1)
-        L_total = R_asc + leg2_len + xp.linalg.norm(o[None, :] - G, axis=1)
-        amp_eff2 = xp.where(valid2, Ab * xp.abs(cos_inc1) * taper1 * R_eff2 * cos_ground, 0.0)
-
+        return_vec = o[None, :] - G
+        return_len = xp.linalg.norm(return_vec, axis=1)
+        if leg2_occlusion_check:
+            return_len_safe = xp.where(return_len > 1e-9, return_len, 1.0)
+            return_dir = return_vec / return_len_safe[:, None]
+            occluded_return = _segment_occluded_by_any_box(xp, G, return_dir, return_len, box_min, box_max,
+                                                             exclude_ids_list=[building_hit])
+            valid2 = valid2 & ~occluded_return
+        sin_retro = None
+        if leg2_retroreflection_check or leg2_retro_taper:
+            # Shared misalignment computation: the TRUE second-bounce
+            # specular direction (mirror-reflecting d_out off the target
+            # surface's own normal -- NOT assumed to retroreflect) vs. the
+            # actual direction from G to the sensor. True automatically
+            # for a 90-degree wall-ground corner AT BROADSIDE, degrades
+            # away from it (see module docstring); NOT guaranteed at all
+            # for an arbitrary building pair.
+            retro_dir = d_out - 2.0 * xp.sum(d_out * surf_normal, axis=1, keepdims=True) * surf_normal
+            return_len_safe2 = xp.where(return_len > 1e-9, return_len, 1.0)
+            to_sensor_dir = return_vec / return_len_safe2[:, None]
+            retro_cos = xp.clip(xp.sum(retro_dir * to_sensor_dir, axis=1), -1.0, 1.0)
+            if leg2_retroreflection_check:
+                retro_angle = xp.arccos(retro_cos)
+                beamwidth = wavelength / xp.maximum(L_wall, wavelength)
+                valid2 = valid2 & (retro_angle < (retro_beamwidth_mult * beamwidth))
+            if leg2_retro_taper:
+                sin_retro = xp.sqrt(xp.clip(1.0 - retro_cos * retro_cos, 0.0, 1.0))   # (F,)
+        L_total = R_asc + leg2_len + return_len
+        amp_eff2_geom = xp.where(valid2, Ab * xp.abs(cos_inc1) * R_eff2 * cos_ground, 0.0)   # (F,) real
         R_equiv2 = L_total / 2.0
         dR2 = R_equiv2 - R_ref
-        phase2 = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR2) / C)
-        leg2_contrib = (amp_eff2[None, :] * phase2).sum(axis=1)
-        s[p, :] += leg2_contrib
-        if return_components:
-            s_by_leg['leg2'][p, :] = leg2_contrib
+        counts['leg2'] += int(to_numpy(xp, valid2).sum())
+
+        if split_leg2_by_target:
+            # Diagnostic only (task #44 investigation): does leg2 behave
+            # differently for wall->GROUND targets (a true 90-degree
+            # dihedral corner -- retroreflective by geometric identity, so
+            # "assume a coherent direct return" is exact) vs wall->BUILDING
+            # targets (an arbitrary building pair generally does NOT meet
+            # at 90 degrees, so there's no guarantee the second surface's
+            # own reflection law actually sends the ray back toward the
+            # sensor -- this function never checks that, it just scores
+            # every nearest-box pair as if it were a valid corner). If
+            # ground-only coherence tracks leg1's ~0.93 while building-only
+            # coherence is near zero, that confirms this is the mechanism
+            # behind leg2's collapse, not occlusion (already ruled out).
+            amp_eff2_ground = xp.where(is_ground, amp_eff2_geom, 0.0)
+            amp_eff2_building = xp.where(is_ground, 0.0, amp_eff2_geom)
+            counts['leg2_ground'] = counts.get('leg2_ground', 0) + int(to_numpy(xp, valid2 & is_ground).sum())
+            counts['leg2_building'] = counts.get('leg2_building', 0) + int(to_numpy(xp, valid2 & ~is_ground).sum())
 
         if include_order3:
             # recurse the SAME primitive from the leg-2 hit point: reflect
@@ -270,19 +526,112 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
 
             leg3_len = xp.linalg.norm(G3 - G, axis=1)
             L_total3 = R_asc + leg2_len + leg3_len + xp.linalg.norm(o[None, :] - G3, axis=1)
-            amp_eff3 = xp.where(valid3, amp_eff2 * R_eff3 * cos_leg3, 0.0)
-
+            # Reuses leg1's envelope same as leg2 did (preserving this
+            # function's pre-existing convention of applying leg1's
+            # taper/alpha to leg3 too) -- NOT necessarily correct physics,
+            # see this same comment's original wording preserved in git
+            # history / this session's notes: a chained facet-to-facet
+            # bounce should arguably have no azimuth persistence at all.
+            # Preserved as-is (include_order3 is off by default, already
+            # documented as "slow, only weakly validated") -- a real fix
+            # belongs with whoever next validates order3 specifically.
+            amp_eff3_geom = xp.where(valid3, amp_eff2_geom * R_eff3 * cos_leg3, 0.0)   # (F,) real
             R_equiv3 = L_total3 / 2.0
             dR3 = R_equiv3 - R_ref
-            phase3 = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR3) / C)
-            leg3_contrib = (amp_eff3[None, :] * phase3).sum(axis=1)
+            counts['leg3'] += int(to_numpy(xp, valid3).sum())
+
+        # ---- Chunked combine (task #41): env1 and phase1/2/3 are all
+        # (F,K)-scale -- at F=146,053/K=4693 (a real scene this session
+        # hit) that's ~11GB PER ARRAY, and this function used to build
+        # FOUR of them (env1 plus one phase per leg) whole, unconditionally.
+        # That OOM'd a 6GB GPU outright, not from fragmentation -- a single
+        # one of those arrays alone exceeds total VRAM. Loop over facet
+        # chunks instead: compute this chunk's alpha-scaled envelope ONCE
+        # (asc_visible_envelope, mask_invisible=False -- amp_eff*_geom
+        # above already zero every row that would have masked, task #39)
+        # and reuse it for all 3 legs' phase x amplitude x envelope
+        # products within the same chunk, accumulating directly into the
+        # pulse's (K,) leg totals. No per-leg (F,K) array is ever
+        # materialized whole, matching ray_facet_intersect's own chunking
+        # convention (dense_sbr_demo.py) and _score_paths'/order-1's
+        # (multibounce_demo.py, same task). ----
+        leg1_contrib = xp.zeros(K, dtype=xp.complex128)
+        leg2_contrib = xp.zeros(K, dtype=xp.complex128)
+        leg3_contrib = xp.zeros(K, dtype=xp.complex128) if include_order3 else None
+        leg2_ground_contrib = xp.zeros(K, dtype=xp.complex128) if split_leg2_by_target else None
+        leg2_building_contrib = xp.zeros(K, dtype=xp.complex128) if split_leg2_by_target else None
+        bytes_per_facet = max(1, K * 16)
+        chunk_size = max(1, int(200_000_000 // bytes_per_facet))
+        for cs in range(0, F, chunk_size):
+            ce = min(cs + chunk_size, F)
+            env_chunk = asc_visible_envelope(
+                xp, o, Cb[cs:ce], freqs, visible1[cs:ce], alpha=1.0, L_az=L_wall[cs:ce], u_hat=Ub[cs:ce],
+                L_el=0.0, low_precision=low_precision_envelope, mask_invisible=False)   # (chunk, K)
+
+            phase1_c = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR1[cs:ce]) / C)
+            leg1_contrib += (amp_eff1_geom[None, cs:ce] * phase1_c * env_chunk.T).sum(axis=1)
+
+            phase2_c = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR2[cs:ce]) / C)
+            env2_chunk = env_chunk
+            if sin_retro is not None:
+                # Dihedral-corner-specific persistence taper (see docstring):
+                # sinc(2*pi*f*L_wall*sin(misalignment)/c), the SAME sinc
+                # form asc_amplitude_envelope already uses for a facet's own
+                # illumination taper, but built from the second-bounce
+                # RETURN-PATH misalignment angle instead -- suppresses
+                # exactly the geometrically-findable-but-not-actually-
+                # retroreflective pairs a hard cutoff either kept in full or
+                # discarded outright with no middle ground.
+                arg_retro = 2.0 * xp.pi * xp.outer(freqs, L_wall[cs:ce] * sin_retro[cs:ce]) / C
+                near_zero_r = xp.abs(arg_retro) < 1e-9
+                arg_retro_safe = xp.where(near_zero_r, 1.0, arg_retro)
+                retro_taper_chunk = xp.where(near_zero_r, 1.0, xp.sin(arg_retro_safe) / arg_retro_safe)
+                env2_chunk = env_chunk * retro_taper_chunk.T
+            leg2_contrib += (amp_eff2_geom[None, cs:ce] * phase2_c * env2_chunk.T).sum(axis=1)
+
+            if split_leg2_by_target:
+                leg2_ground_contrib += (amp_eff2_ground[None, cs:ce] * phase2_c * env2_chunk.T).sum(axis=1)
+                leg2_building_contrib += (amp_eff2_building[None, cs:ce] * phase2_c * env2_chunk.T).sum(axis=1)
+
+            if include_order3:
+                phase3_c = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR3[cs:ce]) / C)
+                leg3_contrib += (amp_eff3_geom[None, cs:ce] * phase3_c * env_chunk.T).sum(axis=1)
+
+        s[p, :] += leg1_contrib
+        if return_components:
+            s_by_leg['leg1'][p, :] = leg1_contrib
+        s[p, :] += leg2_contrib
+        if return_components:
+            s_by_leg['leg2'][p, :] = leg2_contrib
+            if split_leg2_by_target:
+                s_by_leg['leg2_ground'][p, :] = leg2_ground_contrib
+                s_by_leg['leg2_building'][p, :] = leg2_building_contrib
+        if include_order3:
             s[p, :] += leg3_contrib
             if return_components:
                 s_by_leg['leg3'][p, :] = leg3_contrib
 
+        if on_gpu:
+            xp.cuda.Stream.null.synchronize()
         t_total += (time.perf_counter() - t0)
 
-    stats = dict(n_facets=Cb.shape[0], t_total_s=t_total, t_per_pulse_ms=t_total / n_pulses * 1000.0)
+        if on_gpu and free_pool_every and (p + 1) % free_pool_every == 0:
+            xp.get_default_memory_pool().free_all_blocks()
+
+        if progress:
+            postfix = dict(counts)
+            if on_gpu:
+                # Direct evidence for/against the pool-fragmentation
+                # hypothesis above: if used_mb keeps climbing pulse over
+                # pulse (even right after a free_pool_every free), that's
+                # the allocator, not the math, getting slower. If it's
+                # flat, look elsewhere.
+                pool = xp.get_default_memory_pool()
+                postfix['pool_mb'] = f"{pool.used_bytes() / 1e6:.0f}/{pool.total_bytes() / 1e6:.0f}"
+            pbar.set_postfix(postfix, refresh=False)
+
+    stats = dict(n_facets=Cb.shape[0], t_total_s=t_total, t_per_pulse_ms=t_total / n_pulses * 1000.0,
+                 counts=counts)
     if return_components:
         stats['s_by_leg'] = s_by_leg
     return s, stats

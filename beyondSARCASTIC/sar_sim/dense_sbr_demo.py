@@ -273,7 +273,52 @@ def _ray_facet_intersect_chunk(xp, ray_o, ray_d, facets):
     return hit_point, hit_amp, cos_inc, hit_mask, nearest_idx
 
 
-def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000):
+def _ray_aabb_hit(xp, ray_o, ray_d, box_min, box_max, eps=1e-12):
+    """Vectorized ray-vs-axis-aligned-box slab test, (R,B) at once --
+    same slab math as multibounce_demo._segments_blocked_by_buildings,
+    generalized from a bounded SEGMENT (t clipped to [0,1]) to an
+    unbounded RAY (t clipped to [0,inf)), since this is a coarse
+    prefilter feeding ray_facet_intersect's exact per-facet test rather
+    than a final occlusion verdict.
+
+    ray_o, ray_d: (R,3). box_min, box_max: (B,3). Returns (R,B) bool.
+
+    Deliberately permissive: a box hit here doesn't mean the ray hits any
+    real facet in that building (the box is bigger than the building's
+    actual walls at the corners), only that the building can't yet be
+    ruled out. False positives just mean "test that building's exact
+    facets anyway" (no correctness cost, only a smaller perf win); a
+    false negative would silently drop a real hit, so every axis
+    defaults toward "no constraint" rather than "no hit" whenever it
+    can't prove exclusion (see the parallel-ray branch below)."""
+    R_ = ray_o.shape[0]
+    B_ = box_min.shape[0]
+    tmin = xp.full((R_, B_), -xp.inf)
+    tmax = xp.full((R_, B_), xp.inf)
+    for ax in range(3):
+        o_ax = ray_o[:, ax:ax + 1]              # (R,1)
+        d_ax = ray_d[:, ax:ax + 1]               # (R,1)
+        bmin_ax = box_min[None, :, ax]           # (1,B)
+        bmax_ax = box_max[None, :, ax]           # (1,B)
+        parallel = xp.abs(d_ax) < eps            # (R,1)
+        d_safe = xp.where(parallel, 1.0, d_ax)
+        t1 = (bmin_ax - o_ax) / d_safe           # (R,B)
+        t2 = (bmax_ax - o_ax) / d_safe
+        axis_tmin = xp.minimum(t1, t2)
+        axis_tmax = xp.maximum(t1, t2)
+        outside = (o_ax < bmin_ax) | (o_ax > bmax_ax)   # (R,B), broadcasts (R,1) vs (1,B)
+        # parallel to this axis's slab: either the ray's origin is
+        # already outside it (can never enter -> force no-hit on this
+        # axis) or it's inside for all t (this axis adds no constraint)
+        axis_tmin = xp.where(parallel, xp.where(outside, xp.inf, -xp.inf), axis_tmin)
+        axis_tmax = xp.where(parallel, xp.where(outside, -xp.inf, xp.inf), axis_tmax)
+        tmin = xp.maximum(tmin, axis_tmin)
+        tmax = xp.minimum(tmax, axis_tmax)
+    return (tmax >= xp.maximum(tmin, 0.0)) & (tmax >= tmin)
+
+
+def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000,
+                         box_min=None, box_max=None, building_id_of_facet=None):
     """
     ray_o: (3,) a single shared origin (e.g. platform position for this
         pulse -- the bounce-1 case), OR (R,3) a per-ray origin (bounce>=2,
@@ -282,6 +327,31 @@ def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000):
     ray_d: (R,3) ray directions (normalized)
     facets: dict of (F,3)/(F,) arrays from make_building_scene (or a
         concat_facets(...) combination, e.g. buildings + ground)
+
+    box_min, box_max, building_id_of_facet: OPTIONAL two-level culling
+    (see _ray_aabb_hit and multibounce_demo._building_aabbs, which
+    computes exactly these three arrays). When given, each ray-chunk
+    first does a cheap (chunk, n_buildings) box test and only runs the
+    expensive exact per-facet math against facets belonging to a
+    building at least one ray in that chunk could plausibly hit --
+    facets with building_id_of_facet == -1 (e.g. ground) are always
+    included, un-culled. Strictly opt-in and backward compatible: every
+    existing call site that doesn't pass these gets the exact old
+    brute-force behavior, unchanged.
+
+    Why this matters now and didn't before: this codebase's facet counts
+    used to top out around ~1,000 (make_building_scene, 5 facets per
+    building). The joint range+cross-range+Fresnel adaptive partition
+    (adaptive_facet_partition.py) pushed a single 6-building test scene
+    to 13,227 facets, all still tested against every ray with no pruning
+    -- most of them nowhere near any given ray's actual path. Building
+    count stays small (n_buildings, not n_facets), so a building-level
+    prefilter is the cheap axis to cull on before paying the O(rays x
+    facets) bill. This is NOT a BVH (no recursive tree, no per-node
+    traversal) -- just one extra flat level cheap enough to stay fully
+    array-vectorized, which is the point: a real BVH doesn't vectorize
+    well on GPU without a stackless-traversal kernel, not worth the
+    complexity here.
 
     Returns: hit_point (R,3), hit_amp (R,), hit_cos (R,), hit_mask (R,) bool,
     nearest_idx (R,) int -- facet index each ray landed on (only meaningful
@@ -308,21 +378,78 @@ def ray_facet_intersect(xp, ray_o, ray_d, facets, max_chunk_bytes=200_000_000):
     """
     R = ray_d.shape[0]
     F = facets['center'].shape[0]
+    use_culling = box_min is not None and box_max is not None and building_id_of_facet is not None
 
     if ray_o.ndim == 1:
         ray_o = xp.broadcast_to(ray_o[None, :], ray_d.shape)
 
+    # Chunk sizing normally budgets against the FULL facet count F --
+    # correct for the un-culled path, which really does test every facet
+    # per ray. When culling is active, the true per-chunk array is
+    # (chunk, F_active, 3) with F_active typically a small fraction of F
+    # (that's the entire point of culling), so sizing off the full F here
+    # is needlessly conservative -- and on GPU specifically, actively
+    # harmful: each chunk boundary calls xp.nonzero(active_facet) to
+    # build active_idx, whose output size is data-dependent and forces a
+    # device->host sync. More chunks means more forced GPU round-trips,
+    # each stalling the launch pipeline. Measured on real hardware: a
+    # 38,779-facet/50-building GPU (cupy) run held steady at ~115s/pulse
+    # -- WORSE than a same-facet-count CPU/numpy extrapolation, which
+    # should never happen for genuinely more-parallel hardware unless
+    # sync/launch overhead is dominating over actual compute. chunk_size
+    # was ~214 there (200MB budget / (38779*3*8) bytes-per-row), meaning
+    # ~180 chunks and ~180 syncs PER ray_facet_intersect call, several
+    # calls per pulse (order1, order2's reflected-ray continuation, the
+    # return shadow-ray check).
+    #
+    # _CHUNK_BUDGET_MULTIPLIER inflates the effective byte budget used
+    # for sizing when culling is on, trading a larger (but still bounded)
+    # worst-case peak memory for far fewer chunks/syncs. This is a
+    # hypothesis-driven fix, not one verified against real GPU timing --
+    # this project's own sandbox has no GPU (see module docstring). If
+    # measured GPU throughput doesn't improve, the sync itself (not just
+    # its frequency) is the bottleneck and this won't be enough. If a
+    # given scene OOMs a smaller GPU because of this, pass a lower
+    # max_chunk_bytes explicitly to compensate -- this multiplier doesn't
+    # know how much VRAM is actually available.
+    _CHUNK_BUDGET_MULTIPLIER = 8.0
+    effective_budget = max_chunk_bytes * (_CHUNK_BUDGET_MULTIPLIER if use_culling else 1.0)
     bytes_per_ray_row = F * 3 * 8    # the (chunk, F, 3) float64 arrays dominate
-    chunk_size = max(1, int(max_chunk_bytes / max(bytes_per_ray_row, 1)))
+    chunk_size = max(1, int(effective_budget / max(bytes_per_ray_row, 1)))
+
+    def run_chunk(o_chunk, d_chunk):
+        if not use_culling:
+            return _ray_facet_intersect_chunk(xp, o_chunk, d_chunk, facets)
+
+        box_hit = _ray_aabb_hit(xp, o_chunk, d_chunk, box_min, box_max)   # (chunk, B)
+        active_building = xp.any(box_hit, axis=0)                         # (B,)
+        # gather: is this facet's building active this chunk? facets with
+        # id -1 (no building, e.g. ground) are always active.
+        no_building = building_id_of_facet < 0
+        safe_id = xp.where(no_building, 0, building_id_of_facet)
+        active_facet = xp.where(no_building, True, active_building[safe_id])
+        active_idx = xp.nonzero(active_facet)[0]
+
+        n_chunk = o_chunk.shape[0]
+        if active_idx.shape[0] == 0:
+            zeros3 = xp.zeros((n_chunk, 3))
+            return (o_chunk, xp.zeros(n_chunk), xp.zeros(n_chunk),
+                    xp.zeros(n_chunk, dtype=bool), xp.full(n_chunk, -1, dtype=xp.int64))
+
+        sub_facets = {k: facets[k][active_idx] for k in
+                      ('center', 'u_hat', 'v_hat', 'normal', 'half_u', 'half_v', 'amp')}
+        hp, ha, ci, hm, ni_local = _ray_facet_intersect_chunk(xp, o_chunk, d_chunk, sub_facets)
+        ni = active_idx[ni_local]
+        return hp, ha, ci, hm, ni
 
     if chunk_size >= R:
-        return _ray_facet_intersect_chunk(xp, ray_o, ray_d, facets)
+        return run_chunk(ray_o, ray_d)
 
     hit_points, hit_amps, cos_incs, hit_masks, nearest_idxs = [], [], [], [], []
     for start in range(0, R, chunk_size):
         d_chunk = ray_d[start:start + chunk_size]
         o_chunk = ray_o[start:start + chunk_size]
-        hp, ha, ci, hm, ni = _ray_facet_intersect_chunk(xp, o_chunk, d_chunk, facets)
+        hp, ha, ci, hm, ni = run_chunk(o_chunk, d_chunk)
         hit_points.append(hp)
         hit_amps.append(ha)
         cos_incs.append(ci)
@@ -360,10 +487,91 @@ def compute_layover_margin(standoff_m, altitude_m, max_height_m):
     return max_height_m / (altitude_m - max_height_m) * standoff_m
 
 
+def make_angular_aim_grid(xp, footprint_m, n_az, n_el, standoff_m, altitude_m, max_height_m,
+                           o_center=None, az_margin_m=0.0):
+    """Ray DIRECTIONS uniform in (azimuth, elevation) as seen from the
+    sensor, not a ground-plane point grid -- the fix for a real, measured
+    bug in make_aim_grid: a straight ray from a fixed sensor to a fixed
+    ground-plane point crosses any given vertical wall's plane at exactly
+    ONE height, so discovering N different height-subdivided sub-facets
+    on the same wall needs N different ground-plane aim points whose rays
+    happen to cross that wall at N different heights -- and because of
+    layover, all of those crossings land in a narrow ground-range band,
+    not spread across the footprint. Measured: a spatially-uniform grid
+    plateaus at ~14% facet coverage (31/217 facets) no matter how dense
+    (256 to 90,000 rays, no improvement past ~6,400) on a 6-building
+    height-adaptive scene, vs. ~94.5% geometrically plausible by the
+    closed form's own simple cos(incidence)>0 check. An angular grid
+    doesn't have this compression: elevation angle maps close to linearly
+    to height-on-a-wall, so choosing an angular step directly controls
+    height resolution instead of hoping a spatial step happens to produce
+    one. Confirmed on a 400m-tall test triangle: continuous coverage
+    z=0.5m to 385.7m out of 400m in one pass (dense_sbr_demo test,
+    tri_migration.png).
+
+    o_center: representative platform position (e.g. broadside) used to
+    compute the azimuth/elevation window bounds. The window itself is
+    kept FIXED across all pulses in a synthetic aperture (not re-centered
+    per pulse) -- generous enough that platform motion across the
+    aperture doesn't walk the scene outside it (see az_margin_m).
+
+    az_margin_m: extra azimuth coverage (in the platform's own along-
+    track motion units, roughly) beyond the footprint's cross-range
+    extent -- needs to be at least half the synthetic aperture length so
+    a fixed target's azimuth angle (which genuinely changes across the
+    aperture -- that's what creates cross-range resolution) stays inside
+    the window for every pulse.
+
+    Returns dirs: (n_az*n_el, 3) unit ray directions, plus (az_grid, el_grid)
+    for reference/debugging.
+    """
+    if o_center is None:
+        o_center = np.array([0.0, -standoff_m, altitude_m])
+    o_center = np.asarray(o_center, dtype=float)
+
+    # azimuth window: cover the footprint's cross-range (x) extent as seen
+    # from o_center, plus az_margin_m for aperture motion, plus a little
+    # extra so edge pulses don't clip.
+    x_half = footprint_m / 2.0 + az_margin_m
+    corners_x = np.array([-x_half, x_half])
+    los_edges_az = np.arctan2(np.full(2, 0.0) - o_center[1],   # dy (y=0, scene center range)
+                               corners_x - o_center[0])          # dx
+    az_lo, az_hi = np.sort(los_edges_az)
+    az_pad = 0.15 * (az_hi - az_lo) + 1e-6
+    az_lo -= az_pad; az_hi += az_pad
+
+    # elevation window: cover the footprint's near/far range extent (y) at
+    # z=0 AND the full height range up to max_height_m (taller points sit
+    # at a shallower/larger elevation angle at the SAME ground position,
+    # same layover mechanism as compute_layover_margin) -- take the union.
+    y_half = footprint_m / 2.0
+    y_near, y_far = -y_half - o_center[1], y_half - o_center[1]  # relative to sensor
+    el_ground_near = np.arctan2(-o_center[2], y_near)
+    el_ground_far = np.arctan2(-o_center[2], y_far)
+    el_top_near = np.arctan2(max_height_m - o_center[2], y_near)
+    el_top_far = np.arctan2(max_height_m - o_center[2], y_far)
+    el_lo = min(el_ground_near, el_ground_far, el_top_near, el_top_far)
+    el_hi = max(el_ground_near, el_ground_far, el_top_near, el_top_far)
+    el_pad = 0.15 * (el_hi - el_lo) + 1e-6
+    el_lo -= el_pad; el_hi += el_pad
+
+    az_grid = np.linspace(az_lo, az_hi, n_az)
+    el_grid = np.linspace(el_lo, el_hi, n_el)
+    AZ, EL = np.meshgrid(az_grid, el_grid, indexing='ij')
+    dirs = np.stack([np.cos(EL.ravel()) * np.cos(AZ.ravel()),
+                      np.cos(EL.ravel()) * np.sin(AZ.ravel()),
+                      np.sin(EL.ravel())], axis=1)
+    return xp.asarray(dirs), az_grid, el_grid
+
+
 def make_aim_grid(xp, footprint_m, n_rays, standoff_m, altitude_m, max_height_m):
     """Ground-plane primary-ray aim grid, padded by the layover margin so
     elevated facets (roofs, upper walls) aren't systematically missed by
-    a grid sized to the raw building footprint alone."""
+    a grid sized to the raw building footprint alone.
+
+    Superseded for facet-discovery purposes by make_angular_aim_grid (see
+    its docstring for the measured coverage bug this has) -- kept for
+    backward compatibility / A-B comparison, not recommended for new use."""
     margin = compute_layover_margin(standoff_m, altitude_m, max_height_m)
     half = footprint_m / 2.0 + margin
     g = np.linspace(-half, half, n_rays)
