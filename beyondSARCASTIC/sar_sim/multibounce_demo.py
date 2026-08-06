@@ -86,6 +86,7 @@ except ImportError:
 from dense_sbr_demo import (make_building_scene, make_ground_facet, concat_facets,
                              ray_facet_intersect, get_backend, make_aim_grid, C)
 from materials import effective_specular_reflectivity
+from trihedral_asc_closed_form import asc_visible_envelope
 
 
 def to_numpy(a):
@@ -129,10 +130,10 @@ def _reflect_and_intersect_ground_plane(xp, C_bounce, N_bounce, d_in, ground_hal
     return G, valid, d_out
 
 
-def _azimuth_sinc_taper(xp, wavelength, L, normal_xy, look_xy, min_horiz=1e-6):
+def _azimuth_sinc_taper(xp, wavelength, L, normal, u_hat, look_dir, min_horiz=1e-6):
     """
-    Azimuthal beamwidth taper for a finite-length flat scatterer -- a
-    wall's own horizontal extent (its u_hat length), which is what
+    Beamwidth taper for a finite-length flat scatterer of length L along
+    its own u_hat axis -- a wall's own horizontal extent, which is what
     bounds a wall-ground dihedral's overall azimuthal persistence too
     (the ground patch is effectively unbounded by comparison, so the
     wall is the limiting aperture for the whole corner).
@@ -146,43 +147,53 @@ def _azimuth_sinc_taper(xp, wavelength, L, normal_xy, look_xy, min_horiz=1e-6):
     direction along its own length, first null at sin(delta) =
     wavelength/L, NOT a hard geometric include/exclude cutoff.
 
-    Neither branch in this file modeled this before now -- both the
-    ray-traced side (pure ray-optics hit/miss against a facet's
-    rectangular bounds) and the closed-form ASC side (backface cull +
-    geometric reach test) used a binary pass/fail with no smooth
-    angular rolloff. That binary-ness is the actual mechanism behind
-    BOTH previously-measured failure directions, not two unrelated
-    bugs: on the sparse 1000m scene, ridges far off their own broadside
-    direction still counted at full strength as long as they
-    geometrically reached the ground and back, inflating the ASC-side
-    overcount; on the dense 300m scene, a single facet-center sample
-    either passed or failed the reach test outright, with no graceful
-    degradation near the boundary, producing the undercount. A smooth
-    taper replaces both hard cutoffs with the same continuous physical
-    quantity, applied identically on both sides.
+    sin(delta) is the illumination direction's own component along the
+    facet's u_hat axis: dot(look_dir_unit, u_hat_unit), both taken as
+    FULL 3D unit vectors -- not required to be unit length on input,
+    both renormalized here.
 
-    normal_xy, look_xy: (F,2) horizontal (x,y) components of the
-    facet's outward normal and the illumination direction (facet ->
-    source), not required to be unit length on input -- both are
-    renormalized here. Facets whose normal has ~zero horizontal
-    component (a flat roof or the flat ground, both normal=(0,0,1))
-    have no well-defined azimuthal ridge direction at all -- taper=1
-    (no rolloff applied) for those, since their persistence is an
-    elevation/depression-angle effect this term doesn't model, not a
-    horizontal-aperture one.
+    Second version of this function. The first took (normal_xy, look_xy)
+    -- the horizontal (x,y) components only -- and derived sin(delta)
+    via sin(az_look - az_normal), implicitly using "normal rotated 90
+    degrees in the horizontal plane" as a stand-in for u_hat. That's
+    exact for every wall this codebase builds (u_hat IS normal rotated
+    90 degrees horizontally, by construction, for every vertical wall),
+    which is why it validated fine for as long as every facet tested was
+    a vertical building wall. It has no 3D equivalent: "rotate the
+    normal 90 degrees" isn't a unique operation once the normal isn't
+    confined to a horizontal plane, and there's no way to recover u_hat
+    from normal alone for a genuinely tilted facet. Found by testing a
+    boresight-aligned 3-panel trihedral (not a vertical wall) -- the old
+    formula's xy-projection silently discarded each panel's real,
+    physically-relevant z-component, driving computed taper to ~-0.0006
+    (i.e. near-total, wrong suppression) for a panel actually being hit
+    dead-on (cos_incidence=0.58, nowhere near grazing). Taking u_hat and
+    look_dir as full 3D vectors and dropping the separate xy-only
+    renormalization fixes that: for a vertical wall, this changes the
+    computed taper from the old azimuth-only value (independent of
+    depression angle) to one that also reflects the wall's foreshortening
+    at depression -- a genuine refinement, not just a bug-for-bug-
+    identical rewrite, so any existing single/double-bounce number that
+    depended on the old approximation can move slightly, not just the
+    new tilted-facet case.
+
+    normal: (F,3) facet outward normal, used ONLY to detect a roof/
+    ground-like facet (normal's horizontal component ~0) -- those have
+    no well-defined ridge direction along u_hat at all (their
+    persistence is an elevation/depression-angle effect this term
+    doesn't model), so taper=1 (no rolloff) for them, same exemption as
+    before.
     """
-    n_horiz_mag = xp.linalg.norm(normal_xy, axis=1)
-    l_horiz_mag = xp.linalg.norm(look_xy, axis=1)
-    safe = (n_horiz_mag > min_horiz) & (l_horiz_mag > min_horiz)
+    n_horiz_mag = xp.linalg.norm(normal[:, :2], axis=1)
+    u_mag = xp.linalg.norm(u_hat, axis=1)
+    l_mag = xp.linalg.norm(look_dir, axis=1)
+    safe = (n_horiz_mag > min_horiz) & (u_mag > min_horiz) & (l_mag > min_horiz)
 
-    n_mag_safe = xp.where(safe, n_horiz_mag, 1.0)
-    l_mag_safe = xp.where(safe, l_horiz_mag, 1.0)
-    n_n = normal_xy / n_mag_safe[:, None]
-    l_n = look_xy / l_mag_safe[:, None]
-
-    az_n = xp.arctan2(n_n[:, 1], n_n[:, 0])
-    az_l = xp.arctan2(l_n[:, 1], l_n[:, 0])
-    sin_delta = xp.sin(az_l - az_n)
+    u_mag_safe = xp.where(safe, u_mag, 1.0)
+    l_mag_safe = xp.where(safe, l_mag, 1.0)
+    u_n = u_hat / u_mag_safe[:, None]
+    l_n = look_dir / l_mag_safe[:, None]
+    sin_delta = xp.sum(u_n * l_n, axis=1)
 
     arg = 2.0 * xp.pi * L * sin_delta / wavelength
     sinc = xp.where(xp.abs(arg) < 1e-9, 1.0, xp.sin(arg) / arg)
@@ -303,16 +314,34 @@ def _building_aabbs(xp, facets_buildings):
     facet) from the host-side building_cx/cy/w/d/h metadata
     make_building_scene already carries -- box_min/box_max: (n_buildings,3),
     plus building_id_of_facet: (n_facets,) mapping each building facet
-    index to its parent building (make_building_scene always appends
-    exactly n_facets/n_buildings facets per building, in order, so this
-    is a simple integer division, not a search)."""
+    index to its parent building.
+
+    building_id_of_facet: prefer the scene's own facet_building_id when
+    it carries one (make_multi_building_scene_adaptive always does) --
+    REQUIRED there, not just preferred: that scene's adaptive partition
+    gives each wall its own (range x cross-range x Fresnel)-driven facet
+    count, so different buildings end up with different facet counts
+    (measured 137 to 5654 facets/building on one 6-building test scene).
+    The old code here assumed n_facets // n_buildings (uniform per
+    building) unconditionally -- silently correct for make_building_scene
+    (which really does append exactly 5 facets/building, always), but
+    silently WRONG for the adaptive scene: it would slice the flat facet
+    array into n_buildings equal-size chunks that don't align with any
+    building's actual boundaries at all, misattributing most facets to
+    the wrong building's box for every downstream candidate-gating call
+    that uses this map (run_asc_cached_multibounce's leg-2/leg-3
+    visibility gating). Falls back to the uniform-division assumption
+    only when the scene genuinely doesn't carry per-facet ids."""
     cx = facets_buildings['building_cx']; cy = facets_buildings['building_cy']
     w = facets_buildings['building_w']; d = facets_buildings['building_d']; h = facets_buildings['building_h']
     n_buildings = facets_buildings['n_buildings']
-    facets_per_building = facets_buildings['n_facets'] // n_buildings
     box_min = xp.asarray(np.column_stack([cx - w / 2.0, cy - d / 2.0, np.zeros_like(cx)]))
     box_max = xp.asarray(np.column_stack([cx + w / 2.0, cy + d / 2.0, h]))
-    building_id_of_facet = xp.asarray(np.repeat(np.arange(n_buildings), facets_per_building))
+    if 'facet_building_id' in facets_buildings:
+        building_id_of_facet = xp.asarray(facets_buildings['facet_building_id'])
+    else:
+        facets_per_building = facets_buildings['n_facets'] // n_buildings
+        building_id_of_facet = xp.asarray(np.repeat(np.arange(n_buildings), facets_per_building))
     return box_min, box_max, building_id_of_facet
 
 
@@ -390,17 +419,31 @@ def _segment_occluded_by_facets(xp, P0, P1, facets, eps=1e-3):
     return hit_mask & (t_hit < (dist - 2.0 * eps))
 
 
-def _return_visible(xp, hit_pt, hit_normal, o, facets_combined, eps):
+def _return_visible(xp, hit_pt, hit_normal, o, facets_combined, eps,
+                     box_min=None, box_max=None, building_id_of_facet=None):
     """Fire a shadow ray from each bounce point back toward the platform;
     a path is only a valid scattering contributor if nothing else in the
     scene (another building, or the ground) sits between the bounce point
-    and the sensor."""
+    and the sensor.
+
+    box_min/box_max/building_id_of_facet: pass-through to
+    ray_facet_intersect's AABB culling (see that function's docstring).
+    This was the one ray_facet_intersect caller in the pulse loop that
+    DIDN'T get wired up when the culling was added -- measured via
+    profile_first_pulse on a real 38,779-facet/50-building GPU run: this
+    call alone was 86.1% of total pulse time (108s of 126s), because
+    every other call in the loop (order1's direct-to-facet cast, order2's
+    reflected-ray cast) had culling wired in and this one was silently
+    still running full brute-force O(rays x facets) against every ray in
+    the batch, valid or not."""
     dir_ret = o[None, :] - hit_pt
     dist_ret = xp.linalg.norm(dir_ret, axis=1)
     dist_ret_safe = xp.where(dist_ret > 0, dist_ret, 1.0)
     dir_ret_n = dir_ret / dist_ret_safe[:, None]
     o_ret = hit_pt + eps * hit_normal
-    hit_pt_r, _, _, hit_mask_r, _ = ray_facet_intersect(xp, o_ret, dir_ret_n, facets_combined)
+    hit_pt_r, _, _, hit_mask_r, _ = ray_facet_intersect(
+        xp, o_ret, dir_ret_n, facets_combined,
+        box_min=box_min, box_max=box_max, building_id_of_facet=building_id_of_facet)
     t_block = xp.where(hit_mask_r, xp.linalg.norm(hit_pt_r - o_ret, axis=1), xp.inf)
     clear = t_block >= (dist_ret - 2.0 * eps)
     return clear
@@ -455,9 +498,49 @@ def _decode_unique_paths_with_rep(xp, keys_all, valid_mask, n_levels, F_c):
     return levels, rep_ray_idx
 
 
+def _coherent_phase_sum_chunked(xp, freqs, dR, amp, max_chunk_bytes=200_000_000):
+    """(K,) = sum_i amp[i] * exp(-1j*4*pi*freqs*dR[i]/C), chunked over the
+    shared N-length axis of dR/amp so the full (K,N) phase array is never
+    materialized at once -- THE shared place any coherent-sum-over-many-
+    scatterers computation in this codebase should do that summation,
+    same spirit as asc_visible_envelope consolidating the envelope math
+    (task #37/#41).
+
+    This is not a hypothetical safety margin: on a 200-building/146,053-
+    facet scene (n_freq=4693), the unchunked version of exactly this
+    computation needed a single 9.5GB allocation and OOM'd a 6GB GPU
+    outright -- once inside run_multibounce_sbr's order-1 scoring
+    (N = unique facets hit this pulse, up to the full facet count), and
+    separately inside _score_paths' order-2/3 scoring (N = unique path
+    count, which can be even larger). No pool/fragmentation management
+    fixes a single allocation bigger than total VRAM -- this chunks the
+    actual computation instead, same convention ray_facet_intersect
+    already uses for the ray dimension (dense_sbr_demo.py).
+
+    dR, amp: (N,) real -- per-scatterer round-trip range delta and
+    real-valued effective amplitude (already includes every geometric/
+    reflectivity/taper factor; this function only does the phase +
+    coherent sum, same division of labor as everywhere else in this
+    codebase that separates "real amplitude" from "phase").
+    """
+    N = dR.shape[0]
+    K = freqs.shape[0]
+    contrib = xp.zeros(K, dtype=xp.complex128)
+    if N == 0:
+        return contrib
+    bytes_per_item = max(1, K * 16)
+    chunk_size = max(1, int(max_chunk_bytes // bytes_per_item))
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        phase_chunk = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR[start:end]) / C)   # (K, chunk)
+        contrib += (amp[None, start:end] * phase_chunk).sum(axis=1)
+    return contrib
+
+
 def _score_paths(xp, o, ref_pos, freqs, level_idxs, level_centers, level_normals, level_amps,
                   ground_idx=None, ground_material=None, wavelength=None, ground_pos_override=None,
-                  level_uhat=None, level_halfu=None):
+                  level_uhat=None, level_halfu=None, pos_override_unconditional=None,
+                  building_pos_override=None, max_chunk_bytes=200_000_000):
     """Given deduped path index arrays (one (U,) array per bounce level),
     evaluate the analytic per-path contribution and sum coherently.
     Returns (K,) contribution and the path count U.
@@ -478,6 +561,55 @@ def _score_paths(xp, o, ref_pos, freqs, level_idxs, level_centers, level_normals
     scoring match the closed-form ASC side's precision instead of a
     patch grid's.
 
+    building_pos_override: mirror image of ground_pos_override -- applied
+    where level_idxs[i] < ground_idx (building rows) instead of >=
+    (ground rows). Fixes building-target order2's own facet-center
+    position error, measured directly (internal check, this session) as a
+    median ~10.7-wavelength range error, 91.9% of real paths exceeding a
+    quarter wavelength -- replaces the static facet center Cc[idx2] with
+    the literal traced hit point (already computed by ray_facet_intersect,
+    previously discarded for building targets, exactly like
+    ground_pos_override already does for ground). Does NOT force these
+    rows noisy (does NOT skip taper) -- unlike pos_override_unconditional
+    (order3's chained-candidate case), order2 casts exactly one direct-to-
+    facet aim ray per building facet per pulse, so for a persistent
+    (idx1,idx2) path the traced hit point is a continuous ray/plane
+    intersection varying smoothly with platform position, same category as
+    ground_pos_override's analytic point, not a discretely-selectable
+    representative ray. An earlier version of this DID force taper off
+    here (copying the order3 precedent without checking it applied) and
+    measurably REGRESSED leg2_building coherence at full scale (0.6289 ->
+    0.1431, apples-to-apples) -- isolating position vs taper on the same
+    real paths showed facet-center+taper=0.24, hit_pt2+no-taper=0.22,
+    hit_pt2+taper=0.47, i.e. taper was never the problem. Tracked per-row
+    (via noisy_masks below, which building_pos_override deliberately does
+    NOT populate), so ground and building rows in the SAME call get
+    independently correct treatment.
+
+    pos_override_unconditional: like ground_pos_override, but applied
+    regardless of whether the level's facet is ground or building --
+    needed for chained building-only paths (wall-wall-wall, or a
+    trihedral's 3 mutually-orthogonal panels) where the "facet center is
+    a fine stand-in" assumption above breaks down. It's fine for a SINGLE
+    bounce off a wall (the true specular point doesn't move much across
+    typical building-wall sizes), but for an INTERMEDIATE bounce in a
+    chain, the true reflection point is wherever the specific incoming
+    ray actually lands -- which for a corner-reflector-style geometry can
+    be many meters (hundreds of wavelengths) from the facet's centroid,
+    and differs by leg depending on which of several geometrically-valid
+    bounce orderings produced this path. Scoring leg 1 at the facet
+    center while legs 2/3 use one representative ray's real traced hit
+    points (the old ground-only convention) is internally inconsistent --
+    it scores a path that doesn't correspond to any single real ray, and
+    breaks the path-length invariance a true corner reflector has across
+    its aperture. Passing the SAME representative ray's hit point for
+    EVERY level keeps the whole chain self-consistent, restoring that
+    invariance (measured: reduces a trihedral's order-3 phase history
+    from essentially uncorrelated with ray-density-converged ground truth
+    to a well-defined, ray-consistent path). Only used where the caller
+    explicitly opts in (order3 building-only paths); every other call
+    site is unaffected.
+
     Reflectivity per bounce is normally the facet's own static amp value
     (a building wall's pre-drawn reflectivity, unchanged from single-
     bounce). For any bounce landing on the ground (level_idxs[i] >=
@@ -488,19 +620,60 @@ def _score_paths(xp, o, ref_pos, freqs, level_idxs, level_centers, level_normals
     (already computed as cos_i below, not a scene-wide constant). A
     ground bounce at a rough-relative-to-wavelength incidence angle is
     physically suppressed toward zero here rather than contributing the
-    same fixed number every wall-ground path would otherwise get."""
+    same fixed number every wall-ground path would otherwise get.
+
+    max_chunk_bytes: caps the size of the (K, chunk) phase array built
+    per chunk while summing over the U unique paths -- mirrors
+    ray_facet_intersect's own chunking convention (dense_sbr_demo.py),
+    applied here for the same reason. U can be enormous on a dense
+    scene: order-2 unique path counts scale combinatorially with facet
+    count, and the OLD unchunked version built one (K,U) complex128
+    array for the WHOLE path count at once. Measured concretely: a
+    200-building/146,053-facet scene (n_freq=4693) needed a single
+    8.77GB allocation for this array and OOM'd outright on a 6GB GPU --
+    not a fragmentation or pool-bloat problem (no pool management fixes
+    an allocation bigger than total VRAM), a genuine missing-chunking
+    gap. amp_eff (the real, K-independent per-path amplitude) is
+    computed once for all U paths up front, same as before -- only the
+    K x U phase computation, the actual O(K*U) memory hog, is now done
+    chunk by chunk and accumulated."""
     U = int(level_idxs[0].shape[0])
     K = freqs.shape[0]
     if U == 0:
         return xp.zeros(K, dtype=xp.complex128), 0
 
     pts = []
+    noisy_masks = []
     for i in range(len(level_idxs)):
         p_i = level_centers[i][level_idxs[i]]
+        noisy_i = xp.zeros(U, dtype=bool)
         if ground_pos_override is not None and ground_pos_override[i] is not None and ground_idx is not None:
             is_ground_i = level_idxs[i] >= ground_idx
             p_i = xp.where(is_ground_i[:, None], ground_pos_override[i], p_i)
+        if building_pos_override is not None and building_pos_override[i] is not None and ground_idx is not None:
+            is_building_i = level_idxs[i] < ground_idx
+            p_i = xp.where(is_building_i[:, None], building_pos_override[i], p_i)
+            # NOT marked noisy (unlike pos_override_unconditional): this
+            # position comes from a SINGLE direct-to-facet aim ray per
+            # building facet per pulse (no multi-candidate dedup ambiguity
+            # the way order3's chained representative-ray selection has),
+            # so for a persistent (idx1,idx2) path it's a continuous
+            # ray/plane intersection varying SMOOTHLY with platform
+            # position -- same category as ground_pos_override's analytic
+            # ground point, not pos_override_unconditional's discretely-
+            # selectable ray. Measured directly (internal CPU A/B, this
+            # session): forcing taper off here (the original version of
+            # this fix) REGRESSED leg2_building coherence at full 500m/60-
+            # pulse scale (0.6289 -> 0.1431), worse than not fixing the
+            # position at all. Isolating position vs taper on the same real
+            # paths: facet-center+taper=0.24, hit_pt2+no-taper=0.22,
+            # hit_pt2+taper=0.47 -- taper was never the problem, disabling
+            # it was.
+        if pos_override_unconditional is not None and pos_override_unconditional[i] is not None:
+            p_i = pos_override_unconditional[i]
+            noisy_i = xp.ones(U, dtype=bool)
         pts.append(p_i)
+        noisy_masks.append(noisy_i)
     norms = [level_normals[i][level_idxs[i]] for i in range(len(level_idxs))]
     amps = [level_amps[i][level_idxs[i]] for i in range(len(level_idxs))]
 
@@ -531,20 +704,74 @@ def _score_paths(xp, o, ref_pos, freqs, level_idxs, level_centers, level_normals
                 ground_refl = xp.asarray(ground_refl_np)
                 refl_i = xp.where(is_ground, ground_refl, refl_i)
 
+        pos_is_noisy_i = noisy_masks[i]   # (U,) bool -- per-row, not per-level (see building_pos_override docstring)
         if level_halfu is not None and wavelength is not None:
-            # Azimuthal sinc-beamwidth taper (see _azimuth_sinc_taper) --
-            # applies to whichever facet this level's bounce actually
-            # landed on (wall or ground); ground/roof facets have a
-            # vertical normal and get taper=1 automatically (the helper's
-            # near-zero-horizontal-normal guard), so this is safe to call
-            # unconditionally rather than branching on is_ground.
-            # (level_uhat is accepted for API symmetry/future use but not
-            # needed here -- the taper's broadside direction comes from
-            # the facet's own NORMAL azimuth, not u_hat, and only the
-            # facet's length along u_hat, half_u, is actually used.)
+            # Azimuthal sinc-beamwidth taper (see _azimuth_sinc_taper),
+            # SKIPPED whenever this level's position came from
+            # pos_override_unconditional (a single discretely-picked
+            # representative ray, not a deterministic function of
+            # platform position -- see that parameter's docstring).
+            # Gated on the actual position SOURCE, not leg index: an
+            # earlier version of this gated on "i == 0" (entry leg
+            # only), which was wrong -- it also silently stripped taper
+            # from ordinary wall-to-wall order2 paths (leg 2 landing on
+            # ANOTHER building facet, not the ground), even though those
+            # score off the second wall's static CENTER, exactly like
+            # leg 1, and were never exposed to the representative-ray
+            # noise problem in the first place. Gating on the override
+            # source instead of leg index fixes both order3 (all 3 legs
+            # noisy -> taper off) and order2 (leg 2 noisy only when it's
+            # a literal ground hit via ground_pos_override, which is a
+            # SEPARATE, always-safe analytic function of leg 1's own
+            # center -- so ordinary wall-wall order2 keeps its taper).
+            #
+            # Below this level: why taper is safe/meaningful whenever the
+            # position ISN'T overridden -- it's a facet CENTER, a real,
+            # physically meaningful directivity effect (ground/roof
+            # facets get taper=1 automatically via the helper's near-
+            # zero-horizontal-normal guard, so this is safe to call
+            # unconditionally whenever the position is deterministic).
+            #
+            # Why it's wrong wherever the position IS overridden (a
+            # single discretely-picked representative ray standing in
+            # for a whole facet's illuminated population -- see
+            # pos_override_unconditional). Found by testing a boresight-
+            # aligned trihedral: applying this same per-facet taper to a
+            # ray-position-sourced leg is wrong, not just conservative.
+            # The taper's argument (2*pi*L*sin_delta/wavelength) is
+            # enormous for a several-meter, several-hundred-wavelength
+            # facet -- a full sign-flip cycle happens over a sin_delta
+            # step of wavelength/L, which for an 8m panel at X-band is
+            # ~0.004. That's finer than the angular spread FROM THE SAME
+            # FACET across its own few-meter extent as seen from a
+            # several-km sensor, so which literal point a traced ray
+            # happens to hit on the SAME facet swings the taper through
+            # multiple lobes, sign and all, and unlike a facet-center
+            # position (one deterministic point, smoothly varying with
+            # platform position pulse to pulse) an arbitrarily-chosen
+            # representative ray's exact position isn't guaranteed to
+            # vary smoothly either -- so the taper doesn't average out,
+            # it decorrelates pulse-to-pulse into near-total noise.
+            # Measured effect on the trihedral: coherence against the
+            # canonical GTD/ASC point-scatterer form (single point,
+            # alpha=1, no persistence taper -- the literature's actual
+            # closed form for this scatterer type) went from ~0.001
+            # (taper applied to every leg) to 0.997 (taper skipped on
+            # every ray-position-sourced leg, combined with the
+            # pos_override_unconditional fix so every leg uses the same
+            # real ray consistently).
+            # pos_is_noisy_i is now per-ROW (building_pos_override docstring)
+            # rather than per-level: compute the taper for every row (cheap,
+            # vectorized) but force it to 1.0 (no suppression, same as
+            # "skipped") wherever THIS row's own position came from a noisy
+            # override, leaving any OTHER row in the same level (e.g. a
+            # ground row scored via the always-safe ground_pos_override)
+            # with its real, physically meaningful taper intact.
             L_i = 2.0 * level_halfu[i][level_idxs[i]]   # ridge/facet length along its own u_hat axis
             illum_dir = -incoming_n   # direction from this bounce back toward where it came from
-            taper_i = _azimuth_sinc_taper(xp, wavelength, L_i, norms[i][:, :2], illum_dir[:, :2])
+            u_i = level_uhat[i][level_idxs[i]]
+            taper_i = _azimuth_sinc_taper(xp, wavelength, L_i, norms[i], u_i, illum_dir)
+            taper_i = xp.where(pos_is_noisy_i, 1.0, taper_i)
             refl_i = refl_i * taper_i
 
         amp_eff = amp_eff * refl_i * cos_i
@@ -552,14 +779,69 @@ def _score_paths(xp, o, ref_pos, freqs, level_idxs, level_centers, level_normals
     R_ref = xp.linalg.norm(o - ref_pos)
     R_equiv = L_total / 2.0      # see module docstring: matches the existing 4*pi/round-trip=2R convention
     dR = R_equiv - R_ref
-    phase = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR) / C)   # (K,U)
-    contrib = (amp_eff[None, :] * phase).sum(axis=1)
+
+    # Chunked over U via the shared helper (see max_chunk_bytes docstring
+    # above and _coherent_phase_sum_chunked's own docstring) -- the full
+    # (K,U) phase array is never materialized at once.
+    contrib = _coherent_phase_sum_chunked(xp, freqs, dR, amp_eff, max_chunk_bytes=max_chunk_bytes)
     return contrib, U
 
 
 def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_pts, freqs, ref_pos,
-                         max_bounces=3, eps=1e-3, return_components=False, progress=False):
+                         max_bounces=3, eps=1e-3, return_components=False, progress=False,
+                         aim_is_direction=False, profile_first_pulse=False, split_order2_by_target=False,
+                         leg2_retro_check=False, retro_beamwidth_mult=3.0):
     """
+    leg2_retro_check: default False. VALIDITY gate, not an amplitude taper --
+    drops order2 paths outright rather than scoring them at reduced
+    strength. ray_facet_intersect finding a real, unoccluded bounce-2
+    landing point only proves the OUTBOUND geometry exists (bounce-1's own
+    specular direction hits some real facet, and a straight line from there
+    back to the sensor happens to be unoccluded) -- it does NOT verify that
+    any energy actually travels that path back to a monostatic receiver.
+    For that, bounce-2's OWN law of reflection (its real traced incoming
+    direction d2, mirrored off its own real traced normal) has to send the
+    ray back toward the sensor; _score_paths never checks this, only
+    incidence-angle-cosine-weighted reflectivity, so every geometrically-
+    clear double bounce gets scored as a full coherent monostatic return
+    regardless of whether bounce-2's reflection law actually points home.
+
+    Measured directly (internal CPU check, this session, real ray-traced
+    paths on a representative scene): only 8.5% of SBR's own real,
+    occlusion-clear building-target order2 hits also satisfy this (median
+    misalignment 41 degrees, mean 49 degrees) -- the other 91.5% are
+    geometrically real paths that could never coherently return anything to
+    a monostatic sensor, scored at full strength anyway. This is the same
+    physics box_projected_multibounce.py's leg2_retroreflection_check
+    already gates on the ASC side; it was just never applied to SBR's own
+    reference population, which is why sharpening SBR's building-target
+    POSITION precision (building_pos_override, this session) made agreement
+    with ASC's already-gated leg2_building worse, not better -- more
+    precise phase on a population that's 91.5% physically-invalid noise is
+    still noise. For a true wall-ground dihedral this is satisfied
+    automatically (2-mirror retroreflective identity), so gating here
+    should leave ground-target rows essentially unaffected -- same
+    expectation already validated for the ASC-side version of this check.
+
+    retro_beamwidth_mult: diffraction-limited misalignment tolerance in
+    beamwidths (wavelength / the SOURCE wall's own along-wall length, i.e.
+    bounce-1's facet, not bounce-2's target), same convention and default
+    as the ASC-side parameter of the same name.
+
+    split_order2_by_target: default False. When True (with
+    return_components=True), additionally splits order2 by what the
+    SECOND bounce actually hit -- s_by_order['order2_ground'] and
+    ['order2_building'] -- using the same idx2 >= ground_idx test
+    _score_paths already uses internally to decide position/reflectivity
+    source per path (see that function's docstring). Added to make a
+    fair, apples-to-apples comparison possible against
+    box_projected_multibounce.py's own leg2_ground/leg2_building split:
+    comparing ASC's pure-ground leg2 against SBR's FULL (ground+building-
+    mixed) order2 signal understates leg2_ground's real quality whenever
+    SBR's order2 carries real wall-to-wall energy leg2_ground never
+    attempts to represent at all -- that's a comparison artifact, not
+    evidence the ground computation is wrong. This lets each ASC sub-piece
+    be checked against the matching SBR sub-piece instead.
     return_components: when True, stats['s_by_order'] additionally holds
     the PER-ORDER phase histories (order1/order2/order3, each (n_pulses,K))
     separately, not just their sum in `s`. Needed for isolating a specific
@@ -574,6 +856,83 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
     otherwise gives zero feedback until it returns, which is a bad time on
     a multi-hour dense-scene run. Falls back to a no-op if tqdm isn't
     installed. False (default) prints nothing, same as before.
+
+    aim_is_direction: False (default) = aim_pts is a set of 3-D target
+    POINTS; per-pulse ray direction is recomputed as aim_pts - o. True =
+    aim_pts is already a fixed set of unit ray DIRECTIONS
+    (make_angular_aim_grid), used as-is every pulse with no recompute.
+
+    RECOMMENDED usage for a scene with known discretized facets (i.e.
+    every scene this project actually builds): pass
+    aim_pts=facets_buildings['center'] with aim_is_direction=False --
+    one ray directly at every known facet's own center, instead of an
+    exploratory spatial or angular grid hoping to statistically discover
+    facets. This supersedes both make_aim_grid (measured ~14% facet-
+    coverage ceiling from ground-plane/layover compression, regardless of
+    ray density -- see make_angular_aim_grid's docstring for the full
+    diagnosis) and make_angular_aim_grid itself (fixed the height-
+    migration part of that but still undersampled grazing-incidence
+    walls, where a wall's length axis couples into both azimuth and
+    elevation at once -- an independent az x el grid can't efficiently
+    cover that diagonal footprint). Aiming directly at each known facet
+    sidesteps discovery entirely: coverage becomes exhaustive by
+    construction (measured 13214/13227 = 99.9% on the 6-building
+    adaptive-partition test scene, vs. the ~14% angular-grid plateau),
+    and doesn't need any grid/window/margin tuning at all. A ray that
+    lands on a facet OTHER than the one it was aimed at (nearest_idx !=
+    its own index) means that facet is genuinely occluded -- a real,
+    ray-traced occlusion verdict, not the closed form's own analytic-
+    geometry occlusion path (_segment_occluded_by_facets/
+    _reflect_and_intersect_ground_plane in run_asc_cached_multibounce),
+    so this keeps dense SBR an independently-derived reference rather
+    than one sharing the closed form's own geometry code.
+
+    This only works because adaptive_facet_partition.py's joint range +
+    cross-range + Fresnel criterion now sizes every facet to its own
+    local resolution cell -- "one ray, scored at that facet's center, is
+    a valid stand-in for that whole facet" stopped being an approximation
+    and became a resolution-cell-accurate design constraint. Before that
+    partition existed, aiming one ray per (much larger, unsubdivided)
+    facet would have silently repeated the same facet-center-collapse
+    approximation the closed form already makes -- not an independent
+    check on it.
+
+    Real cost, not a free win: this makes ray count and occlusion-test
+    cost scale directly with facet count (O(facets) rays each doing an
+    O(facets)-culled intersection test), not a fixed ray budget --
+    exhaustive-by-construction is the whole point, but it means a much
+    finer partition (see adaptive_facet_partition.py's own facet-count
+    warning) directly costs more per pulse. Measured ~0.9s/pulse
+    (order1+2+3 combined, box-AABB-culled) on a 1,489-facet single-
+    building scene; the full 13,227-facet 6-building scene's order-1
+    alone measured ~22s/pulse -- comfortably tractable for a handful of
+    pulses/validation runs, but worth budgeting for before scripting a
+    full synthetic-aperture (hundreds-to-thousands of pulses) run.
+
+    make_angular_aim_grid is kept for scenes without discrete known
+    facets (e.g. continuous clutter) where there's nothing to aim at
+    directly.
+
+    profile_first_pulse: times pulse 0 only, broken down by stage
+    (order1 ray cast, order1 score, order2 ray cast, order2 return-
+    visibility shadow check, order2 score, order3 if enabled), prints a
+    table, then continues normally for the rest of the pulses. Exists
+    because "which stage actually dominates wall time" is a real open
+    question on GPU backends this project has no hardware to check
+    itself -- a real run on a 38,779-facet/50-building GPU (cupy) scene
+    held steady at ~115-123s/pulse even after widening
+    ray_facet_intersect's culled-path chunk budget 8x (a fix aimed at
+    cutting the number of xp.nonzero() device syncs), which didn't
+    measurably help -- meaning either the sync itself (not its
+    frequency) dominates, or the bottleneck isn't in ray_facet_intersect
+    at all. The (K, F)-shaped scoring arrays (phase1, amp_eff1, etc. --
+    K frequency bins x F visible facets, complex128) are a real
+    candidate: at K~2000+ and F in the tens of thousands, those are
+    multi-GB intermediate arrays per stage, independent of chunking.
+    on_gpu triggers an explicit stream sync before/after each timed
+    block (cupy dispatches asynchronously by default -- an untimed sync
+    would silently attribute one stage's real cost to whichever stage
+    happens to call .get()/a blocking op next).
     """
     n_pulses = plat.shape[0]
     K = freqs.shape[0]
@@ -594,6 +953,16 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
     Ub, HUb = facets_buildings['u_hat'], facets_buildings['half_u']
     Uc, HUc = facets_combined['u_hat'], facets_combined['half_u']
 
+    # Building-level AABB prefilter for ray_facet_intersect (see that
+    # function's own docstring in dense_sbr_demo.py) -- pure perf, no
+    # behavior change: verified bit-identical hit results against the
+    # brute-force path, ~14x measured on a 22,500-ray angular grid against
+    # the 13,227-facet adaptive scene. bid_c extends the buildings-only
+    # id map with -1 (always-active, uncalled) for every ground patch
+    # appended after them in facets_combined.
+    box_min, box_max, bid_b = _building_aabbs(xp, facets_buildings)
+    bid_c = xp.concatenate([bid_b, xp.full(F_c - F_b, -1, dtype=bid_b.dtype)])
+
     s = xp.zeros((n_pulses, K), dtype=xp.complex128)
     counts = dict(order1=0, order2=0, order3=0)
     t_total = 0.0
@@ -602,49 +971,110 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
         s_by_order = dict(order1=xp.zeros((n_pulses, K), dtype=xp.complex128),
                            order2=xp.zeros((n_pulses, K), dtype=xp.complex128),
                            order3=xp.zeros((n_pulses, K), dtype=xp.complex128))
+        if split_order2_by_target:
+            s_by_order['order2_ground'] = xp.zeros((n_pulses, K), dtype=xp.complex128)
+            s_by_order['order2_building'] = xp.zeros((n_pulses, K), dtype=xp.complex128)
 
     pbar = tqdm(range(n_pulses), desc="SBR pulses", disable=not progress)
     for p in pbar:
         o = plat[p]
-        d1 = aim_pts - o[None, :]
-        d1 = d1 / xp.linalg.norm(d1, axis=1, keepdims=True)
+        if aim_is_direction:
+            d1 = aim_pts   # fixed unit directions, same every pulse -- see aim_is_direction docstring
+        else:
+            d1 = aim_pts - o[None, :]
+            d1 = d1 / xp.linalg.norm(d1, axis=1, keepdims=True)
         R_ref = xp.linalg.norm(o - ref_pos)
 
         t0 = time.perf_counter()
 
+        do_profile = profile_first_pulse and p == 0
+        prof = {}
+        t_stage = [t0]
+
+        def _tick(label):
+            if on_gpu:
+                xp.cuda.Stream.null.synchronize()
+            now = time.perf_counter()
+            prof[label] = now - t_stage[0]
+            t_stage[0] = now
+
         # ---- bounce 1: buildings only -- identical convention to
         # sbr_vs_asc_compare.run_dense_sbr_timed's single-bounce path ----
-        hit_pt1, hit_amp1, cos_inc1, hit_mask1, idx1 = ray_facet_intersect(xp, o, d1, facets_buildings)
+        hit_pt1, hit_amp1, cos_inc1, hit_mask1, idx1 = ray_facet_intersect(
+            xp, o, d1, facets_buildings, box_min=box_min, box_max=box_max, building_id_of_facet=bid_b)
         hit_normal1 = Nb[idx1]
+        if do_profile:
+            _tick('order1_raycast')
 
         hit_facets1 = idx1[hit_mask1]
         visible1 = xp.unique(hit_facets1) if hit_facets1.shape[0] > 0 else hit_facets1
         if visible1.shape[0] > 0:
-            vpos = Cb[visible1]; vnorm = Nb[visible1]; vamp = Ab[visible1]
+            vpos = Cb[visible1]; vnorm = Nb[visible1]; vamp = Ab[visible1]; vU = Ub[visible1]
             vL = 2.0 * HUb[visible1]
             look = vpos - o[None, :]
             look = look / xp.linalg.norm(look, axis=1, keepdims=True)
             cos_v = xp.abs(xp.sum(-look * vnorm, axis=1))
-            taper_v = _azimuth_sinc_taper(xp, wavelength, vL, vnorm[:, :2], -look[:, :2])
+            taper_v = _azimuth_sinc_taper(xp, wavelength, vL, vnorm, vU, -look)
             R_v = xp.linalg.norm(vpos - o[None, :], axis=1)
             dR1 = R_v - R_ref
             amp_eff1 = vamp * cos_v * taper_v
-            phase1 = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR1) / C)
-            order1_contrib = (amp_eff1[None, :] * phase1).sum(axis=1)
+            # Chunked (task #41): visible1 is every unique facet a ray hit
+            # THIS pulse -- on a big scene that's up to the full facet
+            # count, and the old unchunked (K,visible1) phase array
+            # measured a real 9.5GB single allocation that OOM'd a 6GB
+            # GPU outright (200-building/146,053-facet scene, n_freq=4693).
+            order1_contrib = _coherent_phase_sum_chunked(xp, freqs, dR1, amp_eff1)
             s[p, :] += order1_contrib
             if return_components:
                 s_by_order['order1'][p, :] = order1_contrib
             counts['order1'] += int(to_numpy(visible1).shape[0])
+        if do_profile:
+            _tick('order1_score')
 
         # ---- bounce 2: reflect off bounce-1 hit, trace against buildings+ground ----
         d2 = d1 - 2.0 * xp.sum(d1 * hit_normal1, axis=1, keepdims=True) * hit_normal1
         o2 = hit_pt1 + eps * hit_normal1
-        hit_pt2, hit_amp2, cos_inc2, hit_mask2_raw, idx2 = ray_facet_intersect(xp, o2, d2, facets_combined)
+        hit_pt2, hit_amp2, cos_inc2, hit_mask2_raw, idx2 = ray_facet_intersect(
+            xp, o2, d2, facets_combined, box_min=box_min, box_max=box_max, building_id_of_facet=bid_c)
         hit_mask2 = hit_mask2_raw & hit_mask1
         hit_normal2 = Nc[idx2]
+        if do_profile:
+            _tick('order2_raycast')
 
-        clear2 = _return_visible(xp, hit_pt2, hit_normal2, o, facets_combined, eps)
+        clear2 = _return_visible(xp, hit_pt2, hit_normal2, o, facets_combined, eps,
+                                  box_min=box_min, box_max=box_max, building_id_of_facet=bid_c)
         valid2 = hit_mask2 & clear2
+        if do_profile:
+            _tick('order2_shadow_check')
+
+        if leg2_retro_check:
+            # See leg2_retro_check's docstring above -- validity gate, not
+            # a taper. Real traced quantities only (d2, hit_normal2,
+            # hit_pt2), same formula as box_projected_multibounce.py's
+            # leg2_retroreflection_check, applied here to SBR's own
+            # reference population instead of just ASC's.
+            retro_dir2 = d2 - 2.0 * xp.sum(d2 * hit_normal2, axis=1, keepdims=True) * hit_normal2
+            return_vec2 = o[None, :] - hit_pt2
+            return_len2 = xp.linalg.norm(return_vec2, axis=1)
+            return_len2_safe = xp.where(return_len2 > 1e-9, return_len2, 1.0)
+            to_sensor_dir2 = return_vec2 / return_len2_safe[:, None]
+            retro_cos2 = xp.clip(xp.sum(retro_dir2 * to_sensor_dir2, axis=1), -1.0, 1.0)
+            retro_angle2 = xp.arccos(retro_cos2)
+            # SOURCE wall's own length (idx1), not the target's -- matches
+            # box_projected_multibounce.py's L_wall convention exactly (the
+            # diffraction-limited beamwidth is the illuminating source
+            # aperture's angular spread, not a property of the target).
+            # Using the target's half_u here first (bug, caught by this
+            # same small-scale test): ground facets have a huge half_u
+            # (spans most of the footprint), making the tolerance absurdly
+            # tight and collapsing ground's counts too (0.99->0.47
+            # coherence, which should be ~untouched -- a true wall-ground
+            # dihedral passes this test almost exactly by construction).
+            L_wall2 = 2.0 * HUb[idx1]
+            beamwidth2 = wavelength / xp.maximum(L_wall2, wavelength)
+            valid2 = valid2 & (retro_angle2 < (retro_beamwidth_mult * beamwidth2))
+            if do_profile:
+                _tick('order2_retro_check')
 
         key2 = idx1.astype(xp.int64) * F_c + idx2.astype(xp.int64)
         lvl2, rep2 = _decode_unique_paths_with_rep(xp, key2, valid2, 2, F_c)
@@ -667,15 +1097,86 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
         d_in_u = C1_u - o[None, :]
         d_in_u = d_in_u / xp.linalg.norm(d_in_u, axis=1, keepdims=True)
         G_analytic, _valid_geom_u, _ = _reflect_and_intersect_ground_plane(xp, C1_u, N1_u, d_in_u, ground_half_extent)
-        ground_pos2 = [None, G_analytic]
+
+        # Building-target position fix: this used to leave building-target
+        # rows scored at Cc[idx2] (the target's static facet CENTER), on
+        # the (now falsified) assumption that building facets are "a few
+        # meters across" everywhere -- true for SENSOR-facing walls
+        # (finely partitioned by adaptive_facet_partition, since that
+        # partitioner sizes resolution relative to the platform), but NOT
+        # true for a wall being hit as a REFLECTION TARGET from another
+        # building: that face's own partitioning has nothing to do with
+        # its distance from the sensor, and measured directly (internal
+        # small-scale check, this session): the resulting facet-center-vs-
+        # literal-hit-point RANGE error has a MEDIAN of ~10.7 wavelengths
+        # and exceeds a quarter wavelength (>90-degree two-way phase
+        # error) for 91.9% of real ray-traced building-target paths on a
+        # representative scene -- i.e. this was already a large, mostly-
+        # decorrelating internal SBR approximation, independent of any
+        # comparison to the closed form. Fix mirrors ground_pos_override's
+        # already-validated pattern exactly: ray_facet_intersect already
+        # computes the literal, continuous hit point (hit_pt2) for every
+        # ray -- it was just being discarded here in favor of the coarse
+        # facet-center lookup. rep2 (from _decode_unique_paths_with_rep,
+        # already computed for this exact purpose) gives one representative
+        # ray per unique (idx1,idx2) path, so hit_pt2[rep2] is directly
+        # usable, no new ray tracing needed.
+        idx2_u = lvl2[1]
+        is_ground2_u = idx2_u >= ground_idx
+        hit_pt2_u = hit_pt2[rep2]
+        # Per-row overrides, not a combined array: ground_pos_override keeps
+        # ground rows on the "clean"/tapered path (already validated,
+        # 0.96+), building_pos_override marks only building rows noisy
+        # (taper skipped) while scoring them at the literal hit point
+        # instead of Cc[idx2]. Passing a single combined array through
+        # pos_override_unconditional (first attempt) would have marked
+        # BOTH as noisy and silently stripped ground's taper too -- see
+        # building_pos_override's docstring in _score_paths.
         contrib2, n2 = _score_paths(xp, o, ref_pos, freqs, lvl2, [Cb, Cc], [Nb, Nc], [Ab, Ac],
                                      ground_idx=ground_idx, ground_material=ground_material,
-                                     wavelength=wavelength, ground_pos_override=ground_pos2,
+                                     wavelength=wavelength,
+                                     ground_pos_override=[None, G_analytic],
+                                     building_pos_override=[None, hit_pt2_u],
                                      level_uhat=[Ub, Uc], level_halfu=[HUb, HUc])
         s[p, :] += contrib2
         if return_components:
             s_by_order['order2'][p, :] = contrib2
         counts['order2'] += n2
+
+        if split_order2_by_target and return_components:
+            # Same idx2 >= ground_idx test _score_paths already applies
+            # internally (position/reflectivity source selection) -- reuse
+            # it here to split the OUTPUT instead of just the internal
+            # scoring choice, so leg2_ground/leg2_building on the ASC side
+            # have a real like-for-like SBR counterpart to compare against.
+            # Both sub-calls operate on an already-homogeneous subset (all-
+            # ground or all-building rows), so ground_pos_override /
+            # building_pos_override are used here purely for consistency
+            # with the main contrib2 call above -- either naming would be
+            # equivalent in effect on a homogeneous subset (no mixed-row
+            # taper-stripping risk within a single sub-call either way).
+            g_np = to_numpy(is_ground2_u)
+            if bool(g_np.any()):
+                lvl2_ground = [lvl2[0][is_ground2_u], lvl2[1][is_ground2_u]]
+                contrib2_ground, n2_ground = _score_paths(
+                    xp, o, ref_pos, freqs, lvl2_ground, [Cb, Cc], [Nb, Nc], [Ab, Ac],
+                    ground_idx=ground_idx, ground_material=ground_material, wavelength=wavelength,
+                    ground_pos_override=[None, G_analytic[is_ground2_u]],
+                    level_uhat=[Ub, Uc], level_halfu=[HUb, HUc])
+                s_by_order['order2_ground'][p, :] = contrib2_ground
+                counts['order2_ground'] = counts.get('order2_ground', 0) + n2_ground
+            if bool((~g_np).any()):
+                not_ground2_u = ~is_ground2_u
+                lvl2_building = [lvl2[0][not_ground2_u], lvl2[1][not_ground2_u]]
+                contrib2_building, n2_building = _score_paths(
+                    xp, o, ref_pos, freqs, lvl2_building, [Cb, Cc], [Nb, Nc], [Ab, Ac],
+                    ground_idx=ground_idx, ground_material=ground_material, wavelength=wavelength,
+                    building_pos_override=[None, hit_pt2_u[not_ground2_u]],
+                    level_uhat=[Ub, Uc], level_halfu=[HUb, HUc])
+                s_by_order['order2_building'][p, :] = contrib2_building
+                counts['order2_building'] = counts.get('order2_building', 0) + n2_building
+        if do_profile:
+            _tick('order2_score')
 
         if max_bounces >= 3:
             # ---- bounce 3: continue tracing from EVERY bounce-2 hit
@@ -684,32 +1185,74 @@ def run_multibounce_sbr(xp, on_gpu, facets_buildings, facets_ground, plat, aim_p
             # buildings+ground again ----
             d3 = d2 - 2.0 * xp.sum(d2 * hit_normal2, axis=1, keepdims=True) * hit_normal2
             o3 = hit_pt2 + eps * hit_normal2
-            hit_pt3, hit_amp3, cos_inc3, hit_mask3_raw, idx3 = ray_facet_intersect(xp, o3, d3, facets_combined)
+            hit_pt3, hit_amp3, cos_inc3, hit_mask3_raw, idx3 = ray_facet_intersect(
+                xp, o3, d3, facets_combined, box_min=box_min, box_max=box_max, building_id_of_facet=bid_c)
             hit_mask3 = hit_mask3_raw & hit_mask2
             hit_normal3 = Nc[idx3]
 
-            clear3 = _return_visible(xp, hit_pt3, hit_normal3, o, facets_combined, eps)
+            clear3 = _return_visible(xp, hit_pt3, hit_normal3, o, facets_combined, eps,
+                                      box_min=box_min, box_max=box_max, building_id_of_facet=bid_c)
             valid3 = hit_mask3 & clear3
 
             key3 = key2 * F_c + idx3.astype(xp.int64)
             lvl3, rep3 = _decode_unique_paths_with_rep(xp, key3, valid3, 3, F_c)
-            # same representative ray's own hit_pt2/hit_pt3 used together
-            # (not mixed with another ray's) so a wall-ground-wall or
-            # wall-wall-ground path stays internally geometrically
-            # consistent, not just individually-accurate per leg
-            ground_pos3 = [None, hit_pt2[rep3], hit_pt3[rep3]]
+            # same representative ray's own hit_pt1/hit_pt2/hit_pt3 used
+            # together for EVERY level (not just the ground ones) --
+            # keeps the whole 3-leg chain internally geometrically
+            # consistent with one real traced ray, not "leg1 at the
+            # facet's static center, legs 2/3 at wherever a possibly-
+            # different sub-ray on the same facet-triple key happened to
+            # land." That mismatch is invisible for an ordinary wall-
+            # ground-wall path (a single wall's true specular point barely
+            # moves), but for a chained building-only path (wall-wall-
+            # wall, or a trihedral's 3 mutually-orthogonal panels) it
+            # breaks the path-length invariance the real geometry has --
+            # see _score_paths' pos_override_unconditional docstring for
+            # the measured effect. hit_pt1 is the literal first-bounce
+            # location for the SAME rep3 ray idx1/idx2/idx3 all came from.
+            # No level_uhat/level_halfu here -- unlike order1/order2 (whose
+            # leg0 position is the facet's static CENTER, varying smoothly
+            # pulse-to-pulse), every order3 leg now scores off a single
+            # discrete representative ray's literal traced hit point (see
+            # pos_override_unconditional above), which can land anywhere
+            # within a facet-triple's valid population -- measured up to
+            # ~360 wavelengths of spread for one trihedral panel. Feeding
+            # that position into the per-facet azimuth taper (whose null
+            # spacing is a tiny fraction of a wavelength of directional
+            # change for an electrically-large facet) makes the taper
+            # swing through multiple lobes depending on exactly which ray
+            # got picked, adding decorrelating noise instead of real
+            # directivity. Dropping it entirely for order3 is also the
+            # physically correct move for genuinely chained/corner-type
+            # paths: the canonical GTD/ASC trihedral scatterer has no
+            # azimuth-persistence term at all (near-isotropic within its
+            # acceptance cone), which is exactly the taper's role for a
+            # single isolated wall -- not applicable once a path is
+            # bouncing facet-to-facet. Measured: restores order3 to 0.997
+            # coherence against the canonical single-point trihedral form.
+            pos3 = [hit_pt1[rep3], hit_pt2[rep3], hit_pt3[rep3]]
             contrib3, n3 = _score_paths(xp, o, ref_pos, freqs, lvl3, [Cb, Cc, Cc], [Nb, Nc, Nc], [Ab, Ac, Ac],
                                          ground_idx=ground_idx, ground_material=ground_material,
-                                         wavelength=wavelength, ground_pos_override=ground_pos3,
-                                         level_uhat=[Ub, Uc, Uc], level_halfu=[HUb, HUc, HUc])
+                                         wavelength=wavelength, pos_override_unconditional=pos3)
             s[p, :] += contrib3
             if return_components:
                 s_by_order['order3'][p, :] = contrib3
             counts['order3'] += n3
+            if do_profile:
+                _tick('order3')
 
         if on_gpu:
             xp.cuda.Stream.null.synchronize()
         t_total += (time.perf_counter() - t0)
+
+        if do_profile:
+            total_profiled = sum(prof.values())
+            print(f"\n--- profile_first_pulse breakdown (pulse 0, {'GPU' if on_gpu else 'CPU'}) ---")
+            for label, dt in prof.items():
+                print(f"  {label:22s} {dt:8.3f}s  ({100*dt/max(total_profiled,1e-9):5.1f}%)")
+            print(f"  {'sum of stages':22s} {total_profiled:8.3f}s")
+            print(f"  {'pulse wall time':22s} {(time.perf_counter()-t0):8.3f}s  "
+                  f"(may exceed the sum above -- untimed gaps are real too)\n")
 
         if progress:
             pbar.set_postfix(counts, refresh=False)
@@ -933,6 +1476,7 @@ def run_asc_cached_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat
     K = freqs.shape[0]
 
     Cb, Nb, Ab = facets_buildings['center'], facets_buildings['normal'], facets_buildings['amp']
+    Ub = facets_buildings['u_hat']              # each wall's own ridge/length axis -- fixed
     L_wall = 2.0 * facets_buildings['half_u']   # each wall's own length along its ridge -- fixed
     HVb = facets_buildings['half_v']            # each wall's own half-height -- fixed
     normal_xy = Nb[:, :2]                        # geometry, computed once outside the per-pulse loop
@@ -974,19 +1518,46 @@ def run_asc_cached_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat
 
         t0 = time.perf_counter()
 
-        # ---- leg 1: sensor -> facet, identical to run_asc_cached except
-        # for the added azimuth taper (see _azimuth_sinc_taper) ----
+        # ---- leg 1: sensor -> facet ----
         look = Cb - o[None, :]
         R_asc = xp.linalg.norm(look, axis=1)
         d_in = look / R_asc[:, None]
         cos_inc1 = xp.sum(-d_in * Nb, axis=1)
         visible1 = cos_inc1 > 0
-        taper1 = _azimuth_sinc_taper(xp, wavelength, L_wall, normal_xy, -d_in[:, :2])
-        amp_eff1 = xp.where(visible1, Ab * xp.abs(cos_inc1) * taper1, 0.0)
+
+        # Real ASC amplitude/persistence envelope (alpha frequency-scaling +
+        # facet-relative azimuth taper), from asc_visible_envelope -- the
+        # ONE shared place every closed-form ASC calculator in this
+        # codebase now gets this from (task #37 consolidation;
+        # box_projected_multibounce.py and run_asc_cached_order3_wall_
+        # ground_wall call the same helper). alpha=1.0, L_el=0.0, u_hat
+        # for azimuth axis: validated choices, see asc_visible_envelope's
+        # own docstring for the full physical rationale (Potter & Moses
+        # 1996 scatterer-type table; L_el=0 measured correct for a
+        # wall-ground corner, 0.971 vs 0.44 coherence).
+        #
+        # taper1 (the OLD real, frequency-flat (F,) taper) is still
+        # computed separately below, because _ground_bounce_subpoint_
+        # contrib (the regime_adaptive/ground_bounce_n_sub>1 escalation
+        # path) sums coherently over sub-points BEFORE applying any
+        # per-frequency term, and needs a plain real per-facet scalar for
+        # that -- restructuring that helper to consume a frequency-
+        # resolved (F,K) complex envelope is a bigger, separate change
+        # (see that function's own docstring) than this consolidation
+        # pass; it keeps using the old taper deliberately, not by
+        # oversight.
+        taper1 = _azimuth_sinc_taper(xp, wavelength, L_wall, Nb, Ub, -d_in)
+
+        env1 = asc_visible_envelope(
+            xp, o, Cb, freqs, visible1, alpha=1.0, L_az=L_wall, u_hat=Ub, L_el=0.0,
+            mask_invisible=False)   # (F, K) complex, unmasked -- every downstream amp_eff*_geom
+        # below already zeros this same set of rows via its own visible/valid mask (task #39)
+
+        amp_eff1_geom = xp.where(visible1, Ab * xp.abs(cos_inc1), 0.0)   # (F,) real, taper now in env1
 
         dR1 = R_asc - R_ref
         phase1 = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR1) / C)
-        leg1_contrib = (amp_eff1[None, :] * phase1).sum(axis=1)
+        leg1_contrib = (amp_eff1_geom[None, :] * phase1 * env1.T).sum(axis=1)
         s[p, :] += leg1_contrib
         if return_components:
             s_by_leg['leg1'][p, :] = leg1_contrib
@@ -1032,10 +1603,11 @@ def run_asc_cached_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat
             R_eff_ground = xp.asarray(R_eff_ground_np)
 
             L_total = R_asc + xp.linalg.norm(G - Cb, axis=1) + xp.linalg.norm(o[None, :] - G, axis=1)
-            # taper1 reused deliberately, not recomputed: the wall is the
+            # env1 (the alpha-scaled complex envelope, computed above for
+            # leg1) reused deliberately, not recomputed: the wall is the
             # limiting aperture for the WHOLE dihedral's azimuthal
             # persistence (the ground patch is effectively unbounded by
-            # comparison), so the same per-facet taper that gates leg1
+            # comparison), so the same per-facet envelope that gates leg1
             # gates leg2 too -- see _azimuth_sinc_taper's docstring.
             #
             # taper_range (_range_distributed_taper) was tried here and
@@ -1060,7 +1632,7 @@ def run_asc_cached_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat
             # per frequency bin (K,F), not once per facet (F,) -- a
             # bigger restructure than fits this pass; left unimplemented
             # rather than shipped as a measured regression.
-            amp_eff2 = xp.where(valid2, Ab * xp.abs(cos_inc1) * taper1 * R_eff_ground * cos_ground, 0.0)
+            amp_eff2_geom = xp.where(valid2, Ab * xp.abs(cos_inc1) * R_eff_ground * cos_ground, 0.0)  # (F,) real, taper now in env1
 
             R_equiv2 = L_total / 2.0
             dR2 = R_equiv2 - R_ref
@@ -1114,8 +1686,8 @@ def run_asc_cached_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat
                 esc_mask = valid2 & escalate_mask
                 n_escalated_total += int(to_numpy(esc_mask).sum())
 
-                amp_eff2_safe = xp.where(safe_mask, Ab * xp.abs(cos_inc1) * taper1 * R_eff_ground * cos_ground, 0.0)
-                leg2_safe = (amp_eff2_safe[None, :] * phase2).sum(axis=1)
+                amp_eff2_geom_safe = xp.where(safe_mask, Ab * xp.abs(cos_inc1) * R_eff_ground * cos_ground, 0.0)
+                leg2_safe = (amp_eff2_geom_safe[None, :] * phase2 * env1.T).sum(axis=1)
                 leg2_escalated = _ground_bounce_subpoint_contrib(
                     xp, o, R_ref, freqs, Cb, Nb, Ab, HVb, d_in, cos_inc1, taper1,
                     esc_mask, half_extent_g, ground_material, wavelength, escalate_n_sub)
@@ -1129,7 +1701,7 @@ def run_asc_cached_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat
                     valid2, half_extent_g, ground_material, wavelength, ground_bounce_n_sub,
                     z_weights=zw)
             else:
-                leg2_contrib = (amp_eff2[None, :] * phase2).sum(axis=1)
+                leg2_contrib = (amp_eff2_geom[None, :] * phase2 * env1.T).sum(axis=1)
             s[p, :] += leg2_contrib
             if return_components:
                 s_by_leg['leg2'][p, :] = leg2_contrib
@@ -1223,32 +1795,32 @@ def run_asc_cached_order3_wall_ground_wall(xp, on_gpu, facets_buildings, facets_
     wall (this codebase's convention throughout: order-1 rays only ever
     target building facets, ground only enters from bounce 2 on).
 
-    This directly answers the session's live question: the azimuth taper
-    (_azimuth_sinc_taper) gives each dihedral corner a beamwidth, but
-    that beamwidth assumes an unobstructed view -- it says nothing about
-    whether some OTHER piece of the scene sits in the way. An earlier
-    docstring in this file called a ray-tracing-free triple bounce
-    unavailable because "which surface does the reflected ray hit next"
-    looked like a search problem. It isn't: once a bounce's exact
-    outgoing direction is known analytically (plain law of reflection off
-    a KNOWN point+normal), finding what it hits next is one deterministic
-    comparison between two exactly-computed candidates (nearest wall,
-    nearest ground point) -- see _next_surface_hit. That reuses the
-    identical intersection math the dense-SBR ray tracer runs; the
-    difference is dense-SBR needs many exploratory rays per pulse because
-    it doesn't know where a ray will land ahead of time, while here the
-    direction is exact at every step, so one test per candidate per step
-    suffices. Zero aim-grid, zero statistical discovery.
+    This directly answers the session's live question: is which surface
+    a reflected ray hits next actually a search problem? It isn't: once
+    a bounce's exact outgoing direction is known analytically (plain law
+    of reflection off a KNOWN point+normal), finding what it hits next
+    is one deterministic comparison between two exactly-computed
+    candidates (nearest wall, nearest ground point) -- see
+    _next_surface_hit. That reuses the identical intersection math the
+    dense-SBR ray tracer runs; the difference is dense-SBR needs many
+    exploratory rays per pulse because it doesn't know where a ray will
+    land ahead of time, while here the direction is exact at every step,
+    so one test per candidate per step suffices. Zero aim-grid, zero
+    statistical discovery.
 
-    Per-bounce reflectivity is generalized uniformly across wall/ground:
-    _azimuth_sinc_taper already returns 1.0 (no rolloff) for any surface
-    whose normal has ~zero horizontal component -- which the ground
-    plane's (0,0,1) normal always does -- so calling it at every bounce
-    without branching on surface type is correct by construction, not a
-    special case. The per-bounce material reflectivity does still branch
-    (building Ab vs. ground's angle-dependent effective_specular_
-    reflectivity), because those are genuinely different physical
-    quantities, not a modeling shortcut.
+    Amplitude/persistence taper: originally each of the 3 bounces
+    computed its OWN independent _azimuth_sinc_taper call (a real,
+    frequency-flat scalar per bounce, multiplied together). Consolidated
+    (task #37) to match the convention run_asc_cached_multibounce and
+    box_projected_multibounce.py both already used: ONE alpha-scaled
+    complex envelope (asc_visible_envelope, from bounce 1's wall only)
+    applied once to the whole path, not once per bounce -- see
+    _bounce_term's docstring for why applying it 3 times was never
+    correct (it would cube the taper for a genuine 3-bounce path). Every
+    bounce (wall or ground) still gets its own real reflectivity*cos
+    geometric factor -- those genuinely differ per surface (building Ab
+    vs. ground's angle-dependent effective_specular_reflectivity) and
+    are unaffected by this consolidation.
 
     Occlusion reuses _segment_occluded_by_facets (the same exact,
     per-facet segment test run_asc_cached_multibounce already uses for
@@ -1264,6 +1836,7 @@ def run_asc_cached_order3_wall_ground_wall(xp, on_gpu, facets_buildings, facets_
     n_facets = facets_buildings['center'].shape[0]
 
     Cb, Nb, Ab = facets_buildings['center'], facets_buildings['normal'], facets_buildings['amp']
+    Ub = facets_buildings['u_hat']
     L_wall = 2.0 * facets_buildings['half_u']
     normal_xy = Nb[:, :2]
     half_extent_g = float(facets_ground.get('footprint_half_extent', to_numpy(facets_ground['half_u'])[0]))
@@ -1274,17 +1847,29 @@ def run_asc_cached_order3_wall_ground_wall(xp, on_gpu, facets_buildings, facets_
     self_idx = xp.arange(n_facets)
 
     def _bounce_term(d_prev, hit_pt, hit_normal, is_ground, wall_idx):
-        """Reflectivity*cos*taper at one bounce, generalized over
-        wall/ground (see docstring)."""
+        """Reflectivity*cos at one bounce (GEOMETRIC factor only, real,
+        no taper), generalized over wall/ground (see docstring).
+
+        Per-bounce taper used to be computed independently at every
+        bounce (own _azimuth_sinc_taper call per leg) -- inconsistent
+        with the convention run_asc_cached_multibounce and
+        box_projected_multibounce.py both use (compute ONE alpha-scaled
+        complex envelope from bounce 1's wall, reuse it -- not
+        recomputed -- for every subsequent leg of the same path, since
+        that wall is the limiting aperture for the whole path's
+        azimuthal persistence). Consolidated to match (task #37): this
+        function now returns only the real reflectivity*cos geometric
+        factor per bounce; the ONE envelope factor (env1, from bounce 1)
+        is applied once to the whole path's amplitude below, not once
+        per bounce -- multiplying it in at every leg would raise the
+        taper to the 3rd power for a genuine 3-bounce path, which was
+        never the intended physics."""
         cos_k = xp.abs(xp.sum(-d_prev * hit_normal, axis=1))
-        L_k = xp.where(is_ground, 1.0, L_wall[wall_idx])          # ignored for ground (taper -> 1)
-        normal_k_xy = xp.where(is_ground[:, None], 0.0, normal_xy[wall_idx])
-        taper_k = _azimuth_sinc_taper(xp, wavelength, L_k, normal_k_xy, -d_prev[:, :2])
         theta_k = xp.arccos(xp.clip(cos_k, 0.0, 1.0))
         R_ground_k = xp.asarray(effective_specular_reflectivity(ground_material, to_numpy(theta_k), wavelength))
         refl_k = xp.where(is_ground, R_ground_k, Ab[wall_idx])
         d_out_k = d_prev - 2.0 * xp.sum(d_prev * hit_normal, axis=1, keepdims=True) * hit_normal
-        return refl_k * cos_k * taper_k, d_out_k
+        return refl_k * cos_k, d_out_k
 
     s = xp.zeros((n_pulses, K), dtype=xp.complex128)
     t_total = 0.0
@@ -1305,9 +1890,21 @@ def run_asc_cached_order3_wall_ground_wall(xp, on_gpu, facets_buildings, facets_
         d_in = look / R1[:, None]
         cos_inc1 = xp.sum(-d_in * Nb, axis=1)
         visible1 = cos_inc1 > 0
-        taper1 = _azimuth_sinc_taper(xp, wavelength, L_wall, normal_xy, -d_in[:, :2])
         d_out1 = d_in - 2.0 * xp.sum(d_in * Nb, axis=1, keepdims=True) * Nb
-        term1 = xp.where(visible1, Ab * xp.abs(cos_inc1) * taper1, 0.0)
+        term1 = xp.where(visible1, Ab * xp.abs(cos_inc1), 0.0)   # (F,) real, taper now in env1 below
+
+        # Real ASC amplitude/persistence envelope, from the SAME shared
+        # helper (asc_visible_envelope, trihedral_asc_closed_form.py)
+        # run_asc_cached_multibounce and box_projected_multibounce.py
+        # both call -- one implementation, task #37. Computed once from
+        # bounce 1's wall (alpha=1.0, L_el=0.0 -- same validated choices
+        # as the other two calculators) and reused unchanged for bounces
+        # 2 and 3 below, not recomputed per bounce -- see _bounce_term's
+        # docstring for why.
+        env1 = asc_visible_envelope(
+            xp, o, Cb, freqs, visible1, alpha=1.0, L_az=L_wall, u_hat=Ub, L_el=0.0,
+            mask_invisible=False)   # (F, K) complex, unmasked -- every downstream amp_eff*_geom
+        # below already zeros this same set of rows via its own visible/valid mask (task #39)
 
         # bounce 2: nearest of {another wall, the ground}
         hit_pt2, hit_normal2, is_ground2, idx2, valid2 = _next_surface_hit(
@@ -1358,14 +1955,14 @@ def run_asc_cached_order3_wall_ground_wall(xp, on_gpu, facets_buildings, facets_
                 occl_full[cand_idx] = blocked
                 valid_all = valid_all & (~occl_full)
 
-        amp_eff3 = xp.where(valid_all, term1 * term2 * term3, 0.0)
+        amp_eff3_geom = xp.where(valid_all, term1 * term2 * term3, 0.0)   # (F,) real, taper now in env1
 
         L_total3 = (R1 + xp.linalg.norm(hit_pt2 - Cb, axis=1)
                     + xp.linalg.norm(hit_pt3 - hit_pt2, axis=1) + xp.linalg.norm(o[None, :] - hit_pt3, axis=1))
         R_equiv3 = L_total3 / 2.0
         dR3 = R_equiv3 - R_ref
         phase3 = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR3) / C)
-        contrib3 = (amp_eff3[None, :] * phase3).sum(axis=1)
+        contrib3 = (amp_eff3_geom[None, :] * phase3 * env1.T).sum(axis=1)
         s[p, :] += contrib3
         if return_components:
             s_by_leg['order3'][p, :] = contrib3
