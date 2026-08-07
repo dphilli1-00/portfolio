@@ -203,7 +203,7 @@ def save_phase_history_cache(cache_dir, key, raw_params, s_sbr, s_asc, plat, fre
 
 def per_building_ssim(facets, db_sbr, db_asc, mag_sbr, mag_asc, phase_sbr, phase_asc,
                        grid_np, standoff_m, altitude_m, sidelobe_margin_m=10.0,
-                       min_crop_px=9, data_range=40.0):
+                       min_crop_px=9, data_range=40.0, phase_rms_floor_db=30.0):
     """
     Score SSIM/RMS per building instead of one whole-scene average.
 
@@ -221,6 +221,48 @@ def per_building_ssim(facets, db_sbr, db_asc, mag_sbr, mag_asc, phase_sbr, phase
     scene-wide worst-case margin used for the ray-aim grid, which would
     over-pad short buildings) + a fixed margin so SSIM's sliding window
     has spatial context to work with.
+
+    phase_rms_floor_db: default 30.0. phase_rms_b/phase_bias_b are
+    amplitude-WEIGHTED (wgt = m_sbr / m_sbr.sum()), but weighting alone
+    does not suppress the noise floor enough -- measured directly (this
+    session, real 1000m/200-building cache): the per-building phase RMS
+    histogram with NO hard floor showed mean=35.08deg, median=33.26deg,
+    dominated by noise-floor pixels' near-random phase (91-98% of pixels
+    sit below -40dB, same dilution mechanism the SSIM floor already fixes
+    for the SSIM number, just not previously applied here). Adding a hard
+    floor -- zero out any pixel below -phase_rms_floor_db before computing
+    wgt, not just downweight it -- collapses that histogram substantially:
+    mean=27.51deg/median=24.57deg at 30dB (this default); an even tighter
+    20dB floor cleans it further still (mean=12.12deg, median=2.65deg),
+    but was rejected as the default after directly measuring what
+    "fraction of pixels kept" actually looks like: whole-image only 1.20%
+    of pixels clear a 20dB floor, and per-building median is 1.07% of
+    crop pixels kept, with 95/200 buildings (nearly half the scene)
+    retaining LESS THAN 1% of their own crop -- often a literal handful
+    of pixels, sometimes falling back to the unmasked crop entirely (see
+    the "else" branch below, n_floor_px==0). A metric computed from 2-3
+    pixels is fragile regardless of whether those were the "right" pixels
+    to keep -- confirmed by the OTHER measured tradeoff at tighter
+    floors: max phase RMS across buildings gets WORSE, not better (82.67
+    -> 134-136deg), exactly the small-sample sensitivity this predicts.
+    30dB keeps only 3.40% of whole-image pixels (still a real, meaningful
+    exclusion, not toothless) but drops only 12/200 buildings below the
+    1%-kept danger zone instead of 95/200 -- picked as the more
+    defensible point on what is, empirically, a smooth power-law-like
+    energy falloff with no natural "noise starts here" knee (measured:
+    even a 60dB floor only keeps 30.62% of pixels; 70% of this scene's
+    image sits below -60dB from peak, so there's no obviously-correct
+    threshold, only a real precision/sample-size tradeoff). 10dB is far
+    too aggressive (190/200 buildings below 1% kept, many at exactly 0%).
+    Pass None to restore the old behavior (soft weighting only, no hard
+    floor).
+
+    Also gates coherence_b and phase_max_b (previously unmasked/using a
+    separate 5%-of-peak convention respectively) on this SAME floor --
+    not a downweight like phase_rms_b/phase_bias_b, a true exclusion
+    (both branches zeroed at masked-out pixels before complex_coherence,
+    removing them from every term of its ratio, not just diluting their
+    contribution).
     """
     n = facets['n_buildings']
     cx, cy = facets['building_cx'], facets['building_cy']
@@ -258,29 +300,60 @@ def per_building_ssim(facets, db_sbr, db_asc, mag_sbr, mag_asc, phase_sbr, phase
         p_sbr = phase_sbr[i_lo:i_hi, j_lo:j_hi]
         p_asc = phase_asc[i_lo:i_hi, j_lo:j_hi]
         dphase = np.angle(np.exp(1j * (p_sbr - p_asc)))
-        wgt = m_sbr / (m_sbr.sum() + 1e-12)
+        m_weight = m_sbr
+        n_floor_px = m_sbr.size
+        if phase_rms_floor_db is not None:
+            floor_mask = crop_sbr > -phase_rms_floor_db
+            n_floor_px = int(floor_mask.sum())
+            if n_floor_px > 0:
+                m_weight = np.where(floor_mask, m_sbr, 0.0)
+            # else: no pixel in this crop clears the floor -- fall back to
+            # the unmasked weight rather than producing a NaN/zero-division
+            # result for this building; n_floor_px stays 0 so this is
+            # visible in the returned dict, not silently swallowed.
+        wgt = m_weight / (m_weight.sum() + 1e-12)
         phase_rms_b = float(np.degrees(np.sqrt(np.sum(wgt * dphase ** 2))))
         # signed bias (not squared) -- distinguishes a consistent offset
         # (structural bug, e.g. mocomp/reference-range convention mismatch
         # between the two branches) from symmetric random scatter, which
         # RMS alone can't tell apart
         phase_bias_b = float(np.degrees(np.sum(wgt * dphase)))
-        # max error among SIGNIFICANT pixels only (>5% of this crop's own
-        # peak) -- unmasked, this is meaningless: noise-floor pixels have
-        # essentially uniform random phase and would dominate a max-error
-        # stat with garbage that has nothing to do with compression fidelity
-        sig_mask = m_sbr > 0.05 * (m_sbr.max() + 1e-12)
+        # max error among SIGNIFICANT pixels only -- unmasked, this is
+        # meaningless: noise-floor pixels have essentially uniform random
+        # phase and would dominate a max-error stat with garbage that has
+        # nothing to do with compression fidelity. Same floor_mask as the
+        # weighted phase RMS above when a hard floor is in use (consistent
+        # "what counts as real signal" across every stat this function
+        # returns); falls back to the old 5%-of-peak convention only when
+        # the caller explicitly disabled the floor (phase_rms_floor_db=None).
+        if phase_rms_floor_db is not None and n_floor_px > 0:
+            sig_mask = floor_mask
+        else:
+            sig_mask = m_sbr > 0.05 * (m_sbr.max() + 1e-12)
         phase_max_b = float(np.degrees(np.abs(dphase[sig_mask]).max())) if sig_mask.any() else 0.0
 
-        c_sbr = m_sbr * np.exp(1j * p_sbr)
-        c_asc = m_asc * np.exp(1j * p_asc)
+        # coherence_b: EXCLUDE (not just downweight) noise-floor pixels --
+        # zeroing both c_sbr and c_asc at masked-out locations removes their
+        # contribution from every term of complex_coherence's ratio
+        # (|sum(a*conj(b))| / sqrt(sum(|a|^2)*sum(|b|^2))), not just the
+        # numerator, so it's a true exclusion rather than a soft downweight.
+        # Previously unmasked entirely -- coherence over a crop where most
+        # pixels are pure noise floor measures the SAME noise-floor
+        # correlation the SSIM-floor and phase-RMS-floor fixes were already
+        # built to avoid, just via a metric that hadn't gotten the same
+        # treatment yet.
+        m_sbr_masked = np.where(sig_mask, m_sbr, 0.0)
+        m_asc_masked = np.where(sig_mask, m_asc, 0.0)
+        c_sbr = m_sbr_masked * np.exp(1j * p_sbr)
+        c_asc = m_asc_masked * np.exp(1j * p_asc)
         coherence_b = complex_coherence(c_sbr, c_asc)
 
         results.append(dict(building=i, cx=float(cx[i]), cy=float(cy[i]), height_m=float(h[i]),
                              crop_px=[int(i_hi - i_lo), int(j_hi - j_lo)], ssim=float(s),
                              amp_rms=amp_rms_b, phase_rms_deg=phase_rms_b,
                              phase_bias_deg=phase_bias_b, phase_max_deg=phase_max_b,
-                             coherence=coherence_b, skipped=False))
+                             coherence=coherence_b, skipped=False,
+                             phase_rms_floor_px=n_floor_px))
     return results
 
 
