@@ -99,6 +99,39 @@ def asc_amplitude_envelope(xp, plat, position, freqs, alpha, L_az=0.0, gamma_az=
     plat = xp.asarray(plat, dtype=real_dtype)
     freqs = xp.asarray(freqs, dtype=real_dtype)
     position = xp.asarray(position, dtype=real_dtype)
+
+    # Trivial-factor detection (this session, --profile on a real 1000m/200-
+    # building run showed this function at 51% of per-pulse cost, the
+    # single biggest line item in the whole ASC loop): every caller in this
+    # codebase (box_projected_multibounce.py, both multibounce_demo.py call
+    # sites) passes L_el=0.0 and never overrides gamma_az/gamma_el away
+    # from their 0.0 default. Mathematically, when L_el==0, arg_el is the
+    # zero array regardless of sin_del, so sinc_el's near_zero_el branch is
+    # taken for EVERY element -- sinc_el is exactly 1.0, not approximately.
+    # Same for damp_az/damp_el when gamma_az/gamma_el==0 (exp(0)=1
+    # regardless of sin_daz/sin_del). The old code computed all three
+    # anyway: a full (K,F)-scale outer product + compare + where + sin +
+    # divide (or exp) per trivial factor, discovering afterward that the
+    # answer was 1.0. This block detects the scalar-zero case at Python
+    # level (cheap, no GPU sync -- L_el/gamma_az/gamma_el are always plain
+    # floats in this codebase, never per-facet arrays) and skips the
+    # corresponding (K,F) array work entirely, falling back to the exact
+    # original computation for any future caller that passes a real
+    # nonzero value. Bit-identical output in the trivial case by
+    # construction (exp(0)=1, sinc(uniformly-zero arg)=1 exactly, not a
+    # tolerance-based approximation) -- validated against the pre-this-
+    # change implementation on both the trivial (L_el=gamma_az=gamma_el=0)
+    # and a deliberately nonzero case before this landed.
+    def _is_zero_scalar(v):
+        return not hasattr(v, 'shape') and not hasattr(v, '__len__') and float(v) == 0.0
+
+    skip_damp_az = _is_zero_scalar(gamma_az)
+    skip_sinc_el = _is_zero_scalar(L_el)
+    skip_damp_el = _is_zero_scalar(gamma_el)
+    need_sin_del = not (skip_sinc_el and skip_damp_el)   # damp_el alone can still need it
+    need_psi = need_sin_del and v_hat is None
+    need_phi = u_hat is None
+
     # Compute whichever of (facet-relative look direction) / (legacy global
     # phi,psi) is actually needed -- independently per axis, since one axis
     # can use u_hat/v_hat while the other falls back to phi_bar/psi_bar
@@ -109,13 +142,15 @@ def asc_amplitude_envelope(xp, plat, position, freqs, alpha, L_az=0.0, gamma_az=
         pos_b = xp.broadcast_to(position, plat.shape) if position.ndim == 1 else position
         look = plat - pos_b
         look_n = look / xp.linalg.norm(look, axis=1, keepdims=True)
-    if u_hat is None or v_hat is None:
+    if need_phi or need_psi:
         if ref_pos is None:
             ref_pos = xp.zeros(3)
         los = plat - ref_pos[None, :]
-        R_ref = xp.linalg.norm(los, axis=1)
-        phi = xp.arctan2(los[:, 1], los[:, 0])
-        psi = xp.arcsin(xp.clip(los[:, 2] / R_ref, -1.0, 1.0))
+        if need_psi:
+            R_ref = xp.linalg.norm(los, axis=1)
+            psi = xp.arcsin(xp.clip(los[:, 2] / R_ref, -1.0, 1.0))
+        if need_phi:
+            phi = xp.arctan2(los[:, 1], los[:, 0])
 
     if f0 is None:
         f0 = float(xp.mean(freqs))
@@ -146,25 +181,38 @@ def asc_amplitude_envelope(xp, plat, position, freqs, alpha, L_az=0.0, gamma_az=
     near_zero_az = xp.abs(arg_az) < 1e-9
     arg_az_safe = xp.where(near_zero_az, 1.0, arg_az)
     sinc_az = xp.where(near_zero_az, 1.0, xp.sin(arg_az_safe) / arg_az_safe)
-    damp_az = xp.exp(-2.0 * xp.pi * xp.outer(freqs, gamma_az * xp.abs(sin_daz)) / C)
 
-    if v_hat is not None:
-        v_arr = xp.asarray(v_hat, dtype=real_dtype)
-        if v_arr.ndim == 1:
-            v_n = v_arr / xp.linalg.norm(v_arr)
-            sin_del = xp.sum(look_n * v_n[None, :], axis=1)
+    if need_sin_del:
+        if v_hat is not None:
+            v_arr = xp.asarray(v_hat, dtype=real_dtype)
+            if v_arr.ndim == 1:
+                v_n = v_arr / xp.linalg.norm(v_arr)
+                sin_del = xp.sum(look_n * v_n[None, :], axis=1)
+            else:
+                v_n = v_arr / xp.linalg.norm(v_arr, axis=1, keepdims=True)
+                sin_del = xp.sum(look_n * v_n, axis=1)
         else:
-            v_n = v_arr / xp.linalg.norm(v_arr, axis=1, keepdims=True)
-            sin_del = xp.sum(look_n * v_n, axis=1)
-    else:
-        sin_del = xp.sin(psi - psi_bar)
-    arg_el = 2.0 * xp.pi * xp.outer(freqs, L_el * sin_del) / C
-    near_zero_el = xp.abs(arg_el) < 1e-9
-    arg_el_safe = xp.where(near_zero_el, 1.0, arg_el)
-    sinc_el = xp.where(near_zero_el, 1.0, xp.sin(arg_el_safe) / arg_el_safe)
-    damp_el = xp.exp(-2.0 * xp.pi * xp.outer(freqs, gamma_el * xp.abs(sin_del)) / C)
+            sin_del = xp.sin(psi - psi_bar)
 
-    env = amp_freq[:, None] * sinc_az * damp_az * sinc_el * damp_el   # (K, n_pulses)
+    # Build the product incrementally, skipping the multiply entirely for
+    # any factor that's a trivial scalar 1.0 -- in this codebase's actual
+    # usage (L_el=gamma_az=gamma_el=0 everywhere), env = amp_freq * sinc_az
+    # is ALL that ever gets computed; damp_az/sinc_el/damp_el are never
+    # materialized as (K,F) arrays at all.
+    env = amp_freq[:, None] * sinc_az
+    if not skip_damp_az:
+        damp_az = xp.exp(-2.0 * xp.pi * xp.outer(freqs, gamma_az * xp.abs(sin_daz)) / C)
+        env = env * damp_az
+    if not skip_sinc_el:
+        arg_el = 2.0 * xp.pi * xp.outer(freqs, L_el * sin_del) / C
+        near_zero_el = xp.abs(arg_el) < 1e-9
+        arg_el_safe = xp.where(near_zero_el, 1.0, arg_el)
+        sinc_el = xp.where(near_zero_el, 1.0, xp.sin(arg_el_safe) / arg_el_safe)
+        env = env * sinc_el
+    if not skip_damp_el:
+        damp_el = xp.exp(-2.0 * xp.pi * xp.outer(freqs, gamma_el * xp.abs(sin_del)) / C)
+        env = env * damp_el
+    # (K, n_pulses)
     return env.T.astype(complex_dtype)   # (n_pulses, K) -- belt-and-suspenders cast in case
     # any upstream numpy/cupy promotion rule (e.g. a bare Python float constant
     # multiplying a float32 array) snuck float64 back in somewhere above.

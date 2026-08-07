@@ -179,6 +179,46 @@ ap.add_argument('--leg1-occlusion-culled', action='store_true',
                       'excluded from the ASC cache staleness fingerprint below, same reasoning as '
                       '--leg2-culled-search and --free-pool-every: only changes HOW leg1 occlusion is '
                       'computed, not what gets scored.')
+ap.add_argument('--profile', action='store_true',
+                 help='per-pulse wall-clock breakdown of the closed-form ASC loop: leg1 occlusion search, '
+                      'leg2\'s reflect/intersect box search, leg2\'s optional occlusion/retro checks, the '
+                      'envelope (sinc/taper) computation, and the phase-exp/multiply/reduce combine for '
+                      'each leg, each measured with an xp.cuda.Stream.null.synchronize() before stopping '
+                      'the clock (cupy queues async -- an un-synced perf_counter() delta would just '
+                      'measure kernel-launch time, not execution time). Prints a sorted table after the '
+                      'run; also stored in asc_stats["profile"]. Zero overhead when omitted -- purely '
+                      'additive instrumentation, does not change what gets scored, excluded from the ASC '
+                      'cache staleness fingerprint same as --leg1-occlusion-culled.')
+ap.add_argument('--low-precision-envelope', action='store_true',
+                 help='switches asc_visible_envelope/asc_amplitude_envelope\'s internal math from '
+                      'float64/complex128 to float32/complex64. Numerically VALIDATED already (an '
+                      'earlier session measured 0.999999999999994 coherence vs full precision) but the '
+                      'GPU speed benefit was never measured -- that validation ran with no GPU available. '
+                      '--profile on a real 1000m/200-building run showed the envelope computation is '
+                      '51.1%% of per-pulse cost (more than phase1+phase2 combined at 34.8%%, and ~4x every '
+                      'occlusion-search lever combined at 13.6%%) -- this is the highest-value untried '
+                      'lever, not the occlusion-culling flags, which is why culling only bought a small '
+                      'real-world speedup despite the earlier validated 1.7-2x at smaller scales. Does '
+                      'NOT touch the phase-exp terms (phase1_c/phase2_c/phase3_c) -- those carry '
+                      'kilometers of range against millimeter wavelength, so float32 there would lose '
+                      'real precision in the wrapped phase; this flag only ever affects the envelope\'s '
+                      'own dtype, unrelated to that term. Excluded from the ASC cache staleness '
+                      'fingerprint below on the same "only changes HOW, not WHAT gets scored" logic as '
+                      '--leg1-occlusion-culled. RE-VALIDATED (this session) at this exact 146,053-facet/'
+                      '200-building/200-pulse scale on real GPU hardware: leg1/leg2/combined raw AND '
+                      'image coherence all matched the full-precision run digit-for-digit (0.9801/0.1825/'
+                      '0.9637 raw, 0.9824/0.0854/0.9589 image). Speed result was smaller than the '
+                      'envelope\'s ~51%% cost share would suggest, though: only a 10.8%% cut to the '
+                      'envelope stage itself (3833.85ms -> 3420.84ms/pulse, ~5.9%% off total pulse time), '
+                      'not the ~50%% a pure memory-halving argument would predict -- asc_amplitude_'
+                      'envelope chains ~8-10 separate elementwise kernel launches (normalize, outer '
+                      'product, near-zero compare+where, sin, divide, exp, repeated for az AND el, then a '
+                      'final multiply) per facet-chunk per pulse, so it likely isn\'t memory-bandwidth-'
+                      'bound the way this flag\'s speed rationale originally assumed -- kernel-launch/op-'
+                      'count overhead looks like the bigger cost, which points at fusing that chain '
+                      '(cupy.fuse()/ElementwiseKernel) as the higher-value next lever, not further '
+                      'precision changes. Real, validated, worth leaving on regardless -- just don\'t '
+                      'expect it alone to close much of the gap to the modeled speedup.')
 ap.add_argument('--asc-cache', type=str, default=None,
                  help='script-local cache for the closed-form (ASC) side, same idea and staleness-'
                       'guard convention as --sbr-cache -- avoids re-paying run_asc_box_projected_'
@@ -337,7 +377,8 @@ else:
           f"split_leg2_by_target={args.split_leg2}, leg2_retroreflection_check={args.leg2_retro_check}, "
           f"leg2_retro_taper={args.leg2_retro_taper}, leg2_building_enabled={not args.leg2_ground_only}, "
           f"leg2_culled_search={args.leg2_culled_search}, leg1_occlusion_check={args.leg1_occlusion_check}, "
-          f"leg1_occlusion_culled={args.leg1_occlusion_culled})...")
+          f"leg1_occlusion_culled={args.leg1_occlusion_culled}, "
+          f"low_precision_envelope={args.low_precision_envelope})...")
     t0 = time.perf_counter()
     s_asc, asc_stats = run_asc_box_projected_multibounce(
         xp, on_gpu, facets_b, facets_g, plat, freqs, ref_pos,
@@ -349,7 +390,8 @@ else:
         leg2_culled_search=args.leg2_culled_search, culled_range_margin=args.culled_range_margin,
         leg1_occlusion_check=args.leg1_occlusion_check,
         leg1_occlusion_chunk_facets=args.leg1_occlusion_chunk_facets,
-        leg1_occlusion_culled=args.leg1_occlusion_culled)
+        leg1_occlusion_culled=args.leg1_occlusion_culled,
+        profile=args.profile, low_precision_envelope=args.low_precision_envelope)
     t_asc = time.perf_counter() - t0
     print(f"  {t_asc:.2f}s wall, counts={asc_stats['counts']}")
     leg1_asc = asc_stats['s_by_leg']['leg1']

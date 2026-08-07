@@ -425,7 +425,7 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
                                        leg2_building_enabled=True, leg2_retro_taper=False,
                                        leg2_culled_search=False, culled_range_margin=1.05,
                                        leg1_occlusion_check=False, leg1_occlusion_chunk_facets=3000,
-                                       leg1_occlusion_culled=False):
+                                       leg1_occlusion_culled=False, profile=False):
     """leg1_occlusion_check: default False. Opt-in fix for the gap this
     module's own docstring flagged from the start and decompose_sbr_asc_
     coherence.py's own module docstring names explicitly: leg1's visible1
@@ -743,9 +743,30 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
 
     t_total = 0.0
     counts = dict(leg1=0, leg2=0, leg3=0)
+    # profile=True: per-stage wall-clock breakdown of one pulse's cost --
+    # occlusion search (leg1 + leg2's reflect/intersect box search) vs. the
+    # envelope (sinc/taper) computation vs. the phase-exp/multiply/reduce
+    # combine, since none of this was ever measured separately before (all
+    # prior speedup work -- culling, chunk-size sweeps -- was guessing at
+    # which of these dominates). Each checkpoint calls
+    # xp.cuda.Stream.null.synchronize() before stopping its clock -- cupy
+    # ops queue asynchronously, so an un-synchronized perf_counter() delta
+    # measures how fast Python enqueues kernels, not how long they take to
+    # run. Zero overhead when profile=False (no sync calls, no dict
+    # bookkeeping beyond the one dict literal below).
+    prof = dict(leg1_occlusion=0.0, reflect_intersect=0.0, leg2_occlusion=0.0,
+                retro_check=0.0, envelope=0.0, phase1=0.0, phase2=0.0, other=0.0) if profile else None
+
+    def _mark(t_prev):
+        if on_gpu:
+            xp.cuda.Stream.null.synchronize()
+        return time.perf_counter()
+
     pbar = tqdm(range(n_pulses), desc="ASC pulses", disable=not progress)
     for p in pbar:
         t0 = time.perf_counter()
+        if profile:
+            tp = _mark(t0)
         o = plat[p]
         R_ref = xp.linalg.norm(o - ref_pos)
 
@@ -762,6 +783,10 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
                 occluded1 = _leg1_occlusion_chunked(xp, o, d_in, R_asc, box_min, box_max, fbid,
                                                      chunk_facets=leg1_occlusion_chunk_facets)
             visible1 = visible1 & ~occluded1
+        if profile:
+            tp2 = _mark(tp)
+            prof['leg1_occlusion'] += tp2 - tp
+            tp = tp2
 
         # amp_eff1_geom / dR1: real, (F,)-scale, cheap regardless of scene
         # size -- alpha=1.0 (canonical GTD flat-plate/dihedral/trihedral
@@ -771,10 +796,18 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         amp_eff1_geom = xp.where(visible1, Ab * xp.abs(cos_inc1), 0.0)   # (F,) real, taper in env (below)
         dR1 = R_asc - R_ref
         counts['leg1'] += int(to_numpy(xp, visible1).sum())
+        if profile:
+            tp2 = _mark(tp)
+            prof['other'] += tp2 - tp
+            tp = tp2
 
         hit = _reflect_and_intersect_scene(xp, Cb, Nb, d_in, half_extent_g, box_min, box_max, fbid, culling=culling)
         G, valid_geom2, d_out = hit['G'], hit['valid'], hit['d_out']
         surf_normal, is_ground, building_hit = hit['surf_normal'], hit['is_ground'], hit['building_hit']
+        if profile:
+            tp2 = _mark(tp)
+            prof['reflect_intersect'] += tp2 - tp
+            tp = tp2
 
         cos_ground = xp.abs(xp.sum(d_out * surf_normal, axis=1))
         valid2 = visible1 & valid_geom2
@@ -797,6 +830,10 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
             occluded_return = _segment_occluded_by_any_box(xp, G, return_dir, return_len, box_min, box_max,
                                                              exclude_ids_list=[building_hit])
             valid2 = valid2 & ~occluded_return
+        if profile:
+            tp2 = _mark(tp)
+            prof['leg2_occlusion'] += tp2 - tp
+            tp = tp2
         sin_retro = None
         if leg2_retroreflection_check or leg2_retro_taper:
             # Shared misalignment computation: the TRUE second-bounce
@@ -816,6 +853,10 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
                 valid2 = valid2 & (retro_angle < (retro_beamwidth_mult * beamwidth))
             if leg2_retro_taper:
                 sin_retro = xp.sqrt(xp.clip(1.0 - retro_cos * retro_cos, 0.0, 1.0))   # (F,)
+        if profile:
+            tp2 = _mark(tp)
+            prof['retro_check'] += tp2 - tp
+            tp = tp2
         L_total = R_asc + leg2_len + return_len
         amp_eff2_geom = xp.where(valid2, Ab * xp.abs(cos_inc1) * R_eff2 * cos_ground, 0.0)   # (F,) real
         R_equiv2 = L_total / 2.0
@@ -897,14 +938,25 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         leg2_building_contrib = xp.zeros(K, dtype=xp.complex128) if split_leg2_by_target else None
         bytes_per_facet = max(1, K * 16)
         chunk_size = max(1, int(200_000_000 // bytes_per_facet))
+        if profile:
+            tpc = _mark(tp)   # close out setup-before-chunk-loop into 'other'
+            prof['other'] += tpc - tp
         for cs in range(0, F, chunk_size):
             ce = min(cs + chunk_size, F)
             env_chunk = asc_visible_envelope(
                 xp, o, Cb[cs:ce], freqs, visible1[cs:ce], alpha=1.0, L_az=L_wall[cs:ce], u_hat=Ub[cs:ce],
                 L_el=0.0, low_precision=low_precision_envelope, mask_invisible=False)   # (chunk, K)
+            if profile:
+                tpc2 = _mark(tpc)
+                prof['envelope'] += tpc2 - tpc
+                tpc = tpc2
 
             phase1_c = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR1[cs:ce]) / C)
             leg1_contrib += (amp_eff1_geom[None, cs:ce] * phase1_c * env_chunk.T).sum(axis=1)
+            if profile:
+                tpc2 = _mark(tpc)
+                prof['phase1'] += tpc2 - tpc
+                tpc = tpc2
 
             phase2_c = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR2[cs:ce]) / C)
             env2_chunk = env_chunk
@@ -931,6 +983,12 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
             if include_order3:
                 phase3_c = xp.exp(-1j * 4.0 * xp.pi * xp.outer(freqs, dR3[cs:ce]) / C)
                 leg3_contrib += (amp_eff3_geom[None, cs:ce] * phase3_c * env_chunk.T).sum(axis=1)
+            if profile:
+                tpc2 = _mark(tpc)
+                prof['phase2'] += tpc2 - tpc
+                tpc = tpc2
+        if profile:
+            tp = _mark(tpc)   # resync outer-loop clock with the chunk loop's
 
         s[p, :] += leg1_contrib
         if return_components:
@@ -949,6 +1007,8 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         if on_gpu:
             xp.cuda.Stream.null.synchronize()
         t_total += (time.perf_counter() - t0)
+        if profile:
+            prof['other'] += time.perf_counter() - tp   # s[p,:]+= assigns, this sync, free_pool_every, postfix
 
         if on_gpu and free_pool_every and (p + 1) % free_pool_every == 0:
             xp.get_default_memory_pool().free_all_blocks()
@@ -969,4 +1029,21 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
                  counts=counts)
     if return_components:
         stats['s_by_leg'] = s_by_leg
+    if profile:
+        stats['profile'] = prof
+        prof_total = sum(prof.values())
+        print(f"\n--- per-pulse profile (n_pulses={n_pulses}, totals across the whole run) ---")
+        print(f"{'stage':<20s}{'total_s':>10s}{'ms/pulse':>12s}{'%':>8s}")
+        for name, t in sorted(prof.items(), key=lambda kv: -kv[1]):
+            pct = 100.0 * t / prof_total if prof_total > 0 else 0.0
+            print(f"{name:<20s}{t:>10.2f}{1000.0 * t / n_pulses:>12.2f}{pct:>7.1f}%")
+        print(f"{'sum of stages':<20s}{prof_total:>10.2f}{1000.0 * prof_total / n_pulses:>12.2f}"
+              f"{'':>8s}  (vs t_total_s={t_total:.2f} -- gap is sync/profiling overhead itself)")
+        print("stage meanings: leg1_occlusion=leg1's box occlusion search; reflect_intersect=leg2's "
+              "nearest-box reflect/intersect search (this is where leg2_culled_search's cull lives); "
+              "leg2_occlusion/retro_check=leg2's optional return-path occlusion + retroreflection checks "
+              "(near-zero if those flags are off); envelope=asc_visible_envelope's sinc/taper math; "
+              "phase1/phase2=the complex exp+multiply+reduce combine per leg (phase2 also includes any "
+              "retro-taper and split_leg2_by_target/order3 work inside that same chunk iteration); "
+              "other=everything not individually timed (setup, bookkeeping, the final sync).")
     return s, stats
