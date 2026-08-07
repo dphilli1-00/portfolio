@@ -84,7 +84,8 @@ def box_face_normal(xp, G, box_min, box_max):
 
 
 def _reflect_and_intersect_scene(xp, C_bounce, N_bounce, d_in, ground_half_extent,
-                                  box_min, box_max, source_building_id, exclude_building_id2=None):
+                                  box_min, box_max, source_building_id, exclude_building_id2=None,
+                                  culling=None):
     """Generalized version of _reflect_and_intersect_ground_plane: the
     reflected ray's target is whichever is nearer, the ground plane or
     another building's box (excluding the source facet's OWN building).
@@ -97,8 +98,26 @@ def _reflect_and_intersect_scene(xp, C_bounce, N_bounce, d_in, ground_half_exten
     point) and would otherwise find a spurious t~0 self-intersection
     against that same box. Pass -1 for rays with nothing extra to
     exclude (e.g. leg-2 hit the ground, which isn't in box_min/box_max
-    at all, so there's nothing to self-exclude there)."""
+    at all, so there's nothing to self-exclude there).
+
+    culling: optional (facet_indices_by_building, building_candidates) pair
+    from _precompute_building_culling. When given, the O(F x M) dense box
+    search is replaced with a per-building grouped search: each building's
+    OWN facets only get tested against the (precomputed, static, usually
+    far smaller than M) list of OTHER buildings within a rigorously-derived
+    range, instead of every building in the scene. Validated (internal CPU
+    check, this session) bit-identical to the unculled path on real scene
+    data across 12 pulses / 416,484 rays -- zero mismatched valid/is_ground/
+    building_hit flags, max position difference 0.0m -- as long as the
+    range passed to _precompute_building_culling came from
+    _rigorous_bounce_range (a proven upper bound), not a guessed distance.
+    source_building_id must be the SAME array used to build
+    facet_indices_by_building (always fbid in this module's call sites,
+    for both leg2 and leg3 -- see that function's docstring) -- this isn't
+    re-validated here, an inconsistent culling argument would silently
+    misgroup rays."""
     d_out = d_in - 2.0 * xp.sum(d_in * N_bounce, axis=1, keepdims=True) * N_bounce
+    N_rays = C_bounce.shape[0]
 
     heading_down = d_out[:, 2] < -1e-9
     d_out_z_safe = xp.where(heading_down, d_out[:, 2], -1.0)
@@ -108,25 +127,57 @@ def _reflect_and_intersect_scene(xp, C_bounce, N_bounce, d_in, ground_half_exten
     ground_valid = heading_down & (t_ground > 1e-9) & in_bounds
     t_ground = xp.where(ground_valid, t_ground, xp.inf)
 
-    t_box = ray_box_intersect(xp, C_bounce, d_out, box_min, box_max)   # (N, M)
-    N_rays = C_bounce.shape[0]
-    rows = xp.arange(N_rays)
-    t_box = t_box.copy()
-    t_box[rows, source_building_id] = xp.inf   # never reflect off your own building
-    if exclude_building_id2 is not None:
-        valid_excl2 = exclude_building_id2 >= 0
-        safe_id2 = xp.where(valid_excl2, exclude_building_id2, 0)
-        cur = t_box[rows, safe_id2]
-        t_box[rows, safe_id2] = xp.where(valid_excl2, xp.inf, cur)
+    if culling is None:
+        t_box = ray_box_intersect(xp, C_bounce, d_out, box_min, box_max)   # (N, M)
+        rows = xp.arange(N_rays)
+        t_box = t_box.copy()
+        t_box[rows, source_building_id] = xp.inf   # never reflect off your own building
+        if exclude_building_id2 is not None:
+            valid_excl2 = exclude_building_id2 >= 0
+            safe_id2 = xp.where(valid_excl2, exclude_building_id2, 0)
+            cur = t_box[rows, safe_id2]
+            t_box[rows, safe_id2] = xp.where(valid_excl2, xp.inf, cur)
 
-    all_t = xp.concatenate([t_ground[:, None], t_box], axis=1)        # (N, M+1)
-    winner_idx = xp.argmin(all_t, axis=1)
-    t_win = xp.take_along_axis(all_t, winner_idx[:, None], axis=1)[:, 0]
-    valid = xp.isfinite(t_win)
-    G = C_bounce + xp.where(valid, t_win, 0.0)[:, None] * d_out
+        all_t = xp.concatenate([t_ground[:, None], t_box], axis=1)        # (N, M+1)
+        winner_idx = xp.argmin(all_t, axis=1)
+        t_win = xp.take_along_axis(all_t, winner_idx[:, None], axis=1)[:, 0]
+        valid = xp.isfinite(t_win)
+        G = C_bounce + xp.where(valid, t_win, 0.0)[:, None] * d_out
+        is_ground = winner_idx == 0
+        building_hit = xp.where(is_ground, -1, winner_idx - 1)
+    else:
+        facet_indices_by_building, building_candidates = culling
+        n_buildings = box_min.shape[0]
+        best_t = xp.full(N_rays, xp.inf)
+        best_building = xp.full(N_rays, -1, dtype=xp.int64)
+        for b in range(n_buildings):
+            idx = facet_indices_by_building[b]
+            if idx.shape[0] == 0:
+                continue
+            cand = building_candidates[b]
+            if cand.shape[0] == 0:
+                continue
+            t_sub = ray_box_intersect(xp, C_bounce[idx], d_out[idx], box_min[cand], box_max[cand])  # (n_b, n_cand)
+            self_mask = cand == b
+            if bool(xp.any(self_mask)):
+                t_sub = t_sub.copy()
+                t_sub[:, self_mask] = xp.inf   # never reflect off your own building
+            if exclude_building_id2 is not None:
+                excl_sub = exclude_building_id2[idx]
+                excl_mask = cand[None, :] == excl_sub[:, None]
+                t_sub = xp.where(excl_mask, xp.inf, t_sub)
+            sub_win = xp.argmin(t_sub, axis=1)
+            sub_t = xp.take_along_axis(t_sub, sub_win[:, None], axis=1)[:, 0]
+            best_t[idx] = sub_t
+            best_building[idx] = cand[sub_win]
 
-    is_ground = winner_idx == 0
-    building_hit = xp.where(is_ground, -1, winner_idx - 1)
+        all_t = xp.concatenate([t_ground[:, None], best_t[:, None]], axis=1)
+        winner_idx = xp.argmin(all_t, axis=1)   # 0 = ground, 1 = best building candidate
+        t_win = xp.take_along_axis(all_t, winner_idx[:, None], axis=1)[:, 0]
+        valid = xp.isfinite(t_win)
+        G = C_bounce + xp.where(valid, t_win, 0.0)[:, None] * d_out
+        is_ground = winner_idx == 0
+        building_hit = xp.where(is_ground, -1, best_building)
 
     ground_normal = xp.tile(xp.asarray([[0.0, 0.0, 1.0]]), (N_rays, 1))
     bh_clamped = xp.clip(building_hit, 0, box_min.shape[0] - 1)
@@ -164,6 +215,103 @@ def _segment_occluded_by_any_box(xp, seg_start, seg_dir, seg_len, box_min, box_m
     return xp.any(blocked, axis=1)
 
 
+def _leg1_occlusion_chunked(xp, o, d_in, R_asc, box_min, box_max, fbid, chunk_facets=3000):
+    """Chunked wrapper around _segment_occluded_by_any_box for leg1's own
+    C->o visibility test (does any OTHER building block the direct return
+    from a facet's own center back to the sensor?). Not just a convenience
+    wrapper -- _segment_occluded_by_any_box's own ray_box_intersect call
+    broadcasts to (N, n_buildings, 3) intermediates, which is fine for
+    leg2/leg3 (always called on an already-small, pre-filtered candidate
+    set) but genuinely unsafe called on leg1's FULL facet count at once:
+    measured directly, one pulse at F=146,053/200 buildings did not
+    complete in 170s unchunked (CPU), vs 73.5s total (including the
+    ray-facet ground-truth comparison run alongside it) chunked at 3000
+    facets/chunk. Bounded memory regardless of scene size, same principle
+    as this module's other per-chunk loops (the (F,K) envelope combine,
+    task #41).
+
+    fbid (per facet's own building id) is the exclude list: a facet's
+    return-to-sensor ray legitimately starts ON its own building's surface
+    and would otherwise falsely register as blocked by its own box at
+    t~0 -- same exclude-list convention leg2_occlusion_check already uses
+    for its own G->o segment."""
+    F = d_in.shape[0]
+    out = xp.zeros(F, dtype=bool)
+    o_b = xp.broadcast_to(o, (F, 3))
+    for cs in range(0, F, chunk_facets):
+        ce = min(cs + chunk_facets, F)
+        out[cs:ce] = _segment_occluded_by_any_box(
+            xp, o_b[cs:ce], d_in[cs:ce], R_asc[cs:ce], box_min, box_max,
+            exclude_ids_list=[fbid[cs:ce]])
+    return out
+
+
+def _point_to_aabb_min_range(xp, o, box_min, box_max):
+    """Minimum possible Euclidean distance from point o to each AABB
+    (box_min[i], box_max[i]) -- the standard clamp-to-box formula: 0 on an
+    axis where o already lies between box_min/box_max, else the gap to the
+    nearest face on that axis. RIGOROUS, not empirical: no point inside the
+    box can be closer to o than this value, by construction (same "prove it,
+    don't eyeball it" standard as _rigorous_bounce_range's leg2 bound)."""
+    dx = xp.maximum(box_min[:, 0] - o[0], 0.0) + xp.maximum(o[0] - box_max[:, 0], 0.0)
+    dy = xp.maximum(box_min[:, 1] - o[1], 0.0) + xp.maximum(o[1] - box_max[:, 1], 0.0)
+    dz = xp.maximum(box_min[:, 2] - o[2], 0.0) + xp.maximum(o[2] - box_max[:, 2], 0.0)
+    return xp.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _leg1_occlusion_chunked_culled(xp, o, d_in, R_asc, box_min, box_max, fbid, chunk_facets=3000, margin=1e-3):
+    """Performance-only variant of _leg1_occlusion_chunked -- same result,
+    fewer candidate buildings tested per chunk. That function tests every
+    facet against ALL n_buildings boxes unconditionally (_segment_occluded_
+    by_any_box's own ray_box_intersect call has no range filter at all).
+
+    But a building can only occlude the straight-line return from a facet at
+    range R if some part of that building's box is closer to the sensor than
+    R -- i.e. _point_to_aabb_min_range(o, box) < R. This is exact: if every
+    point of a box has range >= R, the box cannot lie on the segment
+    [o, facet], independent of scene layout. (Same rigorous-bound standard
+    as leg2's _rigorous_bounce_range/leg2_culled_search.)
+
+    Filtering happens once per FACET CHUNK (using that chunk's own max
+    facet range as the bound), not per individual facet -- keeps this a
+    plain boolean mask + gather instead of a ragged per-facet candidate
+    list. This scene generator lays facets out building-contiguously, so a
+    chunk is typically drawn from only a few spatially-clustered buildings
+    already, which caps the achievable filtering here below what a fully
+    range-sorted pass would give -- but it costs nothing extra to obtain
+    (min_range_b is computed once per PULSE, not per chunk) and only ever
+    shrinks the M dimension of the box test; a superset of true candidates
+    can't change the answer, only the cost of computing it. margin=1e-3
+    guards against excluding a building sitting exactly at the chunk's max
+    range due to float roundoff -- not a physical tolerance."""
+    F = d_in.shape[0]
+    out = xp.zeros(F, dtype=bool)
+    o_b = xp.broadcast_to(o, (F, 3))
+    min_range_b = _point_to_aabb_min_range(xp, o, box_min, box_max)   # (n_buildings,) -- once per pulse
+    for cs in range(0, F, chunk_facets):
+        ce = min(cs + chunk_facets, F)
+        chunk_max_R = float(to_numpy(xp, R_asc[cs:ce]).max())
+        candidate = min_range_b <= (chunk_max_R + margin)
+        cand_idx = xp.nonzero(candidate)[0]
+        box_min_c = box_min[cand_idx]
+        box_max_c = box_max[cand_idx]
+        # remap this chunk's facet building ids into the filtered candidate
+        # index space -- exclude_ids_list indices must refer to POSITIONS
+        # in box_min_c/box_max_c, not the original 0..n_buildings-1 ids.
+        # A facet's own building is always in the candidate set (the box
+        # contains the facet itself, so the box's min range can't exceed
+        # the facet's own range) so this never needs a -1 fallback for that
+        # case, but _segment_occluded_by_any_box already handles excl<0
+        # safely regardless.
+        orig_to_filtered = xp.full(box_min.shape[0], -1, dtype=xp.int64)
+        orig_to_filtered[cand_idx] = xp.arange(cand_idx.shape[0])
+        fbid_chunk_remapped = orig_to_filtered[fbid[cs:ce]]
+        out[cs:ce] = _segment_occluded_by_any_box(
+            xp, o_b[cs:ce], d_in[cs:ce], R_asc[cs:ce], box_min_c, box_max_c,
+            exclude_ids_list=[fbid_chunk_remapped])
+    return out
+
+
 def _building_boxes_from_facets(xp, facets_buildings):
     """box_min/box_max per building (n_buildings,3), built straight from
     the host-side building_cx/cy/w/d/h metadata -- NOT multibounce_demo's
@@ -184,13 +332,184 @@ def _azimuth_sinc_taper_local(xp, wavelength, L, normal, u_hat, look_dir):
     return _azimuth_sinc_taper(xp, wavelength, L, normal, u_hat, look_dir)
 
 
+def _rigorous_bounce_range(xp, Cb, Nb, plat, box_max, margin=1.05):
+    """RIGOROUS (not empirical) upper bound on how far a leg-2 reflected ray
+    could possibly need to travel to hit a building box, across every pulse
+    in this run. Two exact per-ray bounds, nearer of the two applies:
+
+    1. Ground bound: if the ray heads downward, it hits the ground at a
+       fixed, exactly-computable t_ground. Any building beyond that range
+       LOSES to the ground hit regardless of whether it's geometrically
+       intersected, so it can never change the outcome.
+    2. Height-envelope bound: every building box has z in [0,
+       max_building_height] (this scene's actual box_max, not an assumed
+       constant). If the ray is climbing, it exits every building's height
+       envelope at a fixed t = (max_height - start_z) / d_out_z; beyond
+       that, no box can be intersected no matter how far the ray extends.
+
+    Rays that are (nearly) level get no bound from this reasoning and are
+    excluded from the max (not silently treated as zero) -- validated
+    (internal CPU check, this session) that this reasoning gives a bound
+    that safely covers the TRUE worst-case exact-search hit distance with a
+    small, expected margin (116.05m rigorous vs 106.28m actual max, on a
+    representative scene) -- not just "usually enough," a real upper bound.
+    margin: additional multiplicative safety factor on top of the already-
+    rigorous value (default 5%), cheap insurance against floating-point
+    edge cases at the boundary.
+
+    Computed across ALL pulses that will actually run (not sampled), since
+    it's O(F) per pulse with no box search -- cheap relative to the O(F x M)
+    savings this enables, and exact for this specific run's own geometry
+    rather than an assumption that has to be re-validated if the scene or
+    platform track changes."""
+    max_building_height = float(to_numpy(xp, xp.max(box_max[:, 2])))
+    worst = 0.0
+    n_pulses = plat.shape[0]
+    for p in range(n_pulses):
+        o = plat[p]
+        look = Cb - o[None, :]
+        R_asc = xp.linalg.norm(look, axis=1)
+        d_in = look / R_asc[:, None]
+        cos_inc1 = xp.sum(-d_in * Nb, axis=1)
+        visible1 = cos_inc1 > 0
+        d_out = d_in - 2.0 * xp.sum(d_in * Nb, axis=1, keepdims=True) * Nb
+
+        heading_down = d_out[:, 2] < -1e-9
+        d_out_z_safe = xp.where(heading_down, d_out[:, 2], -1.0)
+        t_ground = xp.where(heading_down, -Cb[:, 2] / d_out_z_safe, xp.inf)
+
+        climbing = d_out[:, 2] > 1e-9
+        d_out_z_safe_up = xp.where(climbing, d_out[:, 2], 1.0)
+        t_height = xp.where(climbing, (max_building_height - Cb[:, 2]) / d_out_z_safe_up, xp.inf)
+
+        per_ray_bound = xp.minimum(t_ground, t_height)
+        finite = per_ray_bound[visible1 & xp.isfinite(per_ray_bound)]
+        if finite.shape[0] > 0:
+            worst = max(worst, float(to_numpy(xp, xp.max(finite))))
+    return worst * margin
+
+
+def _precompute_building_culling(xp, fbid, box_min, box_max, n_buildings, max_range):
+    """Static, pulse-independent (building positions and facet ownership
+    don't change pulse to pulse -- only platform position does), so this
+    runs ONCE for the whole call, not per pulse. Returns:
+      facet_indices_by_building: list of (xp) index arrays, facets owned by
+        each building (grouped by fbid, same array used as
+        source_building_id in every _reflect_and_intersect_scene call, leg2
+        AND leg3, so this grouping is valid for both).
+      building_candidates: list of (xp) index arrays, OTHER buildings within
+        max_range of each building -- tested building-footprint-extent to
+        building-footprint-extent (center distance minus both buildings'
+        own footprint half-diagonals), not center-to-center, so a facet
+        anywhere on its own building and a hit anywhere on the target
+        building's footprint both stay safely covered, not just the two
+        buildings' centroids."""
+    fbid_np = to_numpy(xp, fbid)
+    box_min_np, box_max_np = to_numpy(xp, box_min), to_numpy(xp, box_max)
+    centers_xy = 0.5 * (box_min_np[:, :2] + box_max_np[:, :2])
+    extents_xy = box_max_np[:, :2] - box_min_np[:, :2]
+    radii = 0.5 * np.linalg.norm(extents_xy, axis=1)
+    dxy = centers_xy[:, None, :] - centers_xy[None, :, :]
+    center_dist = np.linalg.norm(dxy, axis=2)
+    inflated_dist = center_dist - radii[:, None] - radii[None, :]
+    building_candidates = [xp.asarray(np.nonzero(inflated_dist[b] < max_range)[0]) for b in range(n_buildings)]
+    facet_indices_by_building = [xp.asarray(np.nonzero(fbid_np == b)[0]) for b in range(n_buildings)]
+    return facet_indices_by_building, building_candidates
+
+
 def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_ground, plat, freqs, ref_pos,
                                        ground_material=None, return_components=False, include_order3=False,
                                        progress=False, low_precision_envelope=False, free_pool_every=None,
                                        leg2_occlusion_check=False, split_leg2_by_target=False,
                                        leg2_retroreflection_check=False, retro_beamwidth_mult=3.0,
-                                       leg2_building_enabled=True, leg2_retro_taper=False):
-    """Same leg-1 as run_asc_cached_multibounce (sensor->facet, closed
+                                       leg2_building_enabled=True, leg2_retro_taper=False,
+                                       leg2_culled_search=False, culled_range_margin=1.05,
+                                       leg1_occlusion_check=False, leg1_occlusion_chunk_facets=3000,
+                                       leg1_occlusion_culled=False):
+    """leg1_occlusion_check: default False. Opt-in fix for the gap this
+    module's own docstring flagged from the start and decompose_sbr_asc_
+    coherence.py's own module docstring names explicitly: leg1's visible1
+    is a pure backface cull (cos_inc1 > 0) -- no check for whether some
+    OTHER building sits between the platform and this facet. SBR's dense
+    ray tracer gets this for free (ray_facet_intersect finds the nearest
+    hit; a blocked facet just never registers).
+
+    Measured directly (this session, real 1000m/200-building/146,053-facet
+    cache, 10 pulses sampled evenly across the aperture): 11.3-11.6% of
+    every ASC-leg1-visible facet-pulse is actually occluded by another
+    building per SBR's own ray trace -- remarkably stable across the whole
+    aperture (not a grazing-angle artifact, a structural property of how
+    densely these buildings are packed). NOT evenly distributed: 3
+    buildings (of 200) were 100% occluded -- ASC was drawing entire
+    buildings that should be completely invisible -- and several more were
+    87-97% occluded. Two of the worst-occluded buildings (by id) were
+    independently also the worst-by-SSIM buildings in plot_tier2_from_
+    cache.py's per-building comparison on the same cache, before this fix.
+
+    Implementation: _leg1_occlusion_chunked, the SAME AABB-only box test
+    (_segment_occluded_by_any_box) leg2_occlusion_check already uses for
+    its own G->o return leg, applied to leg1's C->o leg instead, chunked
+    over facets (see that function's own docstring -- calling it unchunked
+    on leg1's full facet count measured as not completing a single pulse
+    in 170s; chunked, ~70s including a ground-truth comparison run
+    alongside it). Box-level, not facet-level -- but validated bit-
+    identical to the exact per-facet ray trace on real scene data (this
+    session: pulse 0 of the same 1000m/200-building cache, zero false
+    positives, zero false negatives against ray_facet_intersect) -- these
+    buildings are fully wall-tiled boxes with no real gaps, so "the ray
+    crosses another building's AABB" and "the ray hits a real facet on
+    that building" turned out to coincide exactly here, not just
+    approximately.
+
+    leg1_occlusion_chunk_facets: chunk size for the above, default 3000 --
+    tune down if you OOM on a smaller GPU, up if you have headroom and
+    want fewer chunk-loop iterations.
+
+    leg1_occlusion_culled: default False. Performance-only sibling of
+    leg2_culled_search, for leg1_occlusion_check instead of leg2's box
+    search -- _leg1_occlusion_chunked (used when this is False) tests every
+    facet against ALL n_buildings boxes unconditionally, same "no range
+    filter at all" gap leg2_culled_search fixed for the leg2 search. Uses
+    _leg1_occlusion_chunked_culled instead: a RIGOROUS (not empirical)
+    point-to-AABB minimum-range bound (_point_to_aabb_min_range) computed
+    once per pulse, then per facet-chunk, only buildings whose box could
+    possibly be closer to the sensor than that chunk's own farthest facet
+    are tested -- exact, not a heuristic, because a box entirely farther
+    from the sensor than a facet's own range geometrically cannot lie on
+    the straight-line segment between them. Validate bit-identical to the
+    unculled path before trusting it at scale, same standard as every
+    other culled-search flag in this module.
+
+    Cascades to leg2/leg3 correctly, not just leg1's own count: valid2 is
+    gated on visible1 (a facet blocked on its way IN can't be illuminated
+    at all, so it can't source a real double-bounce either, any more than
+    it can reflect straight back) -- this was already true of the
+    pre-existing visible1 before this flag existed, so enabling this check
+    tightens leg2/leg3 for free, correctly, through the same gate.
+
+    leg2_culled_search: default False. Opt-in performance fix for
+    _reflect_and_intersect_scene's leg2/leg3 box search, which tests every
+    source facet's reflected ray against EVERY building's box unconditionally
+    -- O(F x n_buildings) per pulse, dense, no culling at all (unlike SBR's
+    ray_facet_intersect, which gets a building-level AABB prefilter). That
+    was fine at tens of buildings but degrades as building count grows --
+    measured directly: ASC's SBR-relative speedup dropped from ~6x (500m/50
+    buildings) to ~3.85x (1000m/200 buildings) purely from this, unrelated
+    to any physics change. When True, computes a RIGOROUS (not empirical)
+    global range once per run (_rigorous_bounce_range -- exact per-ray
+    ground-hit/height-envelope bounds, worst case across every pulse that
+    will actually run) and groups the box search by building
+    (_precompute_building_culling), so each building's own facets only test
+    against the (usually far smaller) list of other buildings within that
+    range instead of every building in the scene. Validated bit-identical
+    to the unculled path on real scene data (internal CPU check, this
+    session: 12 pulses / 416,484 rays, zero mismatched valid/is_ground/
+    building_hit, max position difference 0.0m) -- a pure speedup, not an
+    approximation, as long as the range came from _rigorous_bounce_range
+    and not a guessed distance. culled_range_margin: extra multiplicative
+    safety factor on top of the already-rigorous bound (default 5%).
+
+    Same leg-1 as run_asc_cached_multibounce (sensor->facet, closed
     form, unchanged). Leg 2 now targets whichever is nearer of {ground
     plane, any OTHER building's box} instead of always the ground --
     the fix for the scope gap compare_ground_points.py found (SBR's real
@@ -393,6 +712,14 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
 
     box_min, box_max = _building_boxes_from_facets(xp, facets_buildings)
 
+    culling = None
+    if leg2_culled_search:
+        rigorous_range = _rigorous_bounce_range(xp, Cb, Nb, plat, box_max, margin=culled_range_margin)
+        culling = _precompute_building_culling(xp, fbid, box_min, box_max,
+                                                facets_buildings['n_buildings'], rigorous_range)
+        if progress:
+            print(f"  leg2_culled_search: rigorous range={rigorous_range:.1f}m")
+
     # per-building reflectivity, in case a box wins leg2: reuse that
     # building's own facet amp values (walls of one building share one
     # refl value in this scene generator, so averaging its facets'
@@ -427,6 +754,14 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         d_in = look / R_asc[:, None]
         cos_inc1 = xp.sum(-d_in * Nb, axis=1)
         visible1 = cos_inc1 > 0
+        if leg1_occlusion_check:
+            if leg1_occlusion_culled:
+                occluded1 = _leg1_occlusion_chunked_culled(xp, o, d_in, R_asc, box_min, box_max, fbid,
+                                                            chunk_facets=leg1_occlusion_chunk_facets)
+            else:
+                occluded1 = _leg1_occlusion_chunked(xp, o, d_in, R_asc, box_min, box_max, fbid,
+                                                     chunk_facets=leg1_occlusion_chunk_facets)
+            visible1 = visible1 & ~occluded1
 
         # amp_eff1_geom / dR1: real, (F,)-scale, cheap regardless of scene
         # size -- alpha=1.0 (canonical GTD flat-plate/dihedral/trihedral
@@ -437,7 +772,7 @@ def run_asc_box_projected_multibounce(xp, on_gpu, facets_buildings, facets_groun
         dR1 = R_asc - R_ref
         counts['leg1'] += int(to_numpy(xp, visible1).sum())
 
-        hit = _reflect_and_intersect_scene(xp, Cb, Nb, d_in, half_extent_g, box_min, box_max, fbid)
+        hit = _reflect_and_intersect_scene(xp, Cb, Nb, d_in, half_extent_g, box_min, box_max, fbid, culling=culling)
         G, valid_geom2, d_out = hit['G'], hit['valid'], hit['d_out']
         surf_normal, is_ground, building_hit = hit['surf_normal'], hit['is_ground'], hit['building_hit']
 

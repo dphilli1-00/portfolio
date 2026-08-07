@@ -97,9 +97,9 @@ ap.add_argument('--sbr-leg2-retro-check', action='store_true',
                  help='SBR-side counterpart, separate flag from --leg2-retro-check (which only '
                       'gates ASC): run_multibounce_sbr never checks whether bounce-2\'s own law of '
                       'reflection sends the ray back to the sensor, only that a geometric sightline '
-                      'is unoccluded -- measured directly that only 8.5% of SBR\'s real building-'
+                      'is unoccluded -- measured directly that only 8.5%% of SBR\'s real building-'
                       'target order2 hits are actually retroreflective, so SBR\'s own reference '
-                      'population is 91.5% non-physical noise scored at full coherent strength. '
+                      'population is 91.5%% non-physical noise scored at full coherent strength. '
                       'This is a VALIDITY gate on SBR\'s own population (see run_multibounce_sbr\'s '
                       'leg2_retro_check docstring), not just another ASC-side ablation -- pass this '
                       'alongside --leg2-retro-check for a real apples-to-apples comparison, since '
@@ -108,6 +108,15 @@ ap.add_argument('--sbr-leg2-retro-check', action='store_true',
 ap.add_argument('--retro-beamwidth-mult', type=float, default=3.0,
                  help='misalignment tolerance in beamwidths for --leg2-retro-check/--sbr-leg2-retro-check '
                       '(wider = more permissive)')
+ap.add_argument('--free-pool-every', type=int, default=None,
+                 help='on_gpu only: call cupy free_all_blocks() every this-many ASC pulses. Was left '
+                      'off by default (see run_asc_box_projected_multibounce docstring) after an '
+                      'earlier session measured pool_mb flat (used AND total both static) while '
+                      'per-pulse time still grew -- a compute bug (asc_visible_envelope gather/'
+                      'scatter), not fragmentation, so freeing wouldn\'t have helped THAT case. '
+                      'Real fragmentation looks different: total_bytes climbing while used_bytes '
+                      'stays flat -- if you see that pattern in the tqdm postfix at a new scale, '
+                      'pass this to actually test the fix instead of guessing.')
 ap.add_argument('--leg2-ground-only', action='store_true',
                  help='comparison: drop wall->building leg2 entirely, fall back to the '
                       'originally-validated ground-only leg2 case, to check whether the '
@@ -118,6 +127,67 @@ ap.add_argument('--leg2-retro-taper', action='store_true',
                       'hard cutoff -- leg2 currently reuses leg1\'s own wall-illumination taper for '
                       'its amplitude, which has nothing to do with dihedral corner directivity; this '
                       'gives leg2 its own persistence taper based on the actual corner misalignment angle')
+ap.add_argument('--leg2-culled-search', action='store_true',
+                 help='performance-only optimization for leg2\'s box search: precompute static '
+                      'per-building candidate lists (buildings don\'t move pulse-to-pulse) using a '
+                      'rigorously-derived, not empirical, global max range -- combining an exact '
+                      'ground-hit bound and an exact building-height-envelope bound per ray, worst '
+                      'case taken across all pulses -- so each facet only tests buildings that could '
+                      'possibly be hit instead of every building in the scene. Validated bit-identical '
+                      '(0.000e+00 diff on s_total/leg1/leg2/leg2_ground/leg2_building, including with '
+                      'leg2_building>0 real hits) against the unculled dense search on real scene data. '
+                      'See box_projected_multibounce.py\'s _rigorous_bounce_range docstring for the '
+                      'derivation. Deliberately excluded from the ASC cache staleness fingerprint below, '
+                      'same reasoning as --free-pool-every: this only changes HOW the search runs, not '
+                      'what gets scored.')
+ap.add_argument('--culled-range-margin', type=float, default=1.05,
+                 help='safety margin multiplier on top of the rigorous per-pulse worst-case bound '
+                      'for --leg2-culled-search (default 5%% margin)')
+ap.add_argument('--leg1-occlusion-check', action='store_true',
+                 help='leg1\'s visible1 = cos_inc1 > 0 is a pure backface cull with no check for '
+                      'whether ANOTHER building blocks the direct return path -- measured on the '
+                      'real 1000m/200-building cache: 11.3-11.6%% of all ASC-leg1-visible facet-'
+                      'pulses are actually occluded per SBR\'s own ray trace (stable across the '
+                      'whole aperture), with three buildings 100%% phantom and several others 87-97%% '
+                      'phantom; two of those independently matched the worst-SSIM building list. This '
+                      'reuses the same box-only _segment_occluded_by_any_box primitive leg2_occlusion '
+                      'already uses (chunked over facets -- unchunked OOMs/thrashes at leg1\'s full '
+                      'facet count), validated bit-exact (0 false positives, 0 false negatives) against '
+                      'the expensive per-facet ray-trace ground truth on real scene data. Also correctly '
+                      'cascades to leg2/leg3 for free via the existing valid2=visible1&valid_geom2 gate: '
+                      'a facet occluded on the way in cannot source any reflection. See '
+                      'box_projected_multibounce.py\'s run_asc_box_projected_multibounce docstring for '
+                      'the full derivation.')
+ap.add_argument('--leg1-occlusion-chunk-facets', type=int, default=3000,
+                 help='facet chunk size for --leg1-occlusion-check\'s box-search (memory/perf knob '
+                      'only, does not change what gets scored)')
+ap.add_argument('--leg1-occlusion-culled', action='store_true',
+                 help='performance-only optimization for --leg1-occlusion-check\'s box search, same '
+                      'idea as --leg2-culled-search: the unculled path tests every facet against ALL '
+                      'n_buildings boxes unconditionally. A building can only occlude a facet\'s '
+                      'return if some part of its box is closer to the sensor than the facet\'s own '
+                      'range -- a RIGOROUS (not empirical) bound, computed once per pulse via a '
+                      'point-to-AABB minimum-range formula, then applied per facet-chunk to drop '
+                      'buildings that provably cannot be occluders. Validated bit-identical to the '
+                      'unculled path on real scene data (0.000e+00 max diff on s_asc, matching leg1/'
+                      'leg2 counts, at both 10- and 50-building test scales); ~1.7-2x speedup measured '
+                      'at those scales -- capped below leg2_culled_search\'s speedup because this '
+                      'scene generator lays facets out building-contiguously, so a facet chunk is '
+                      'already spatially clustered and the per-chunk range bound isn\'t as tight as a '
+                      'fully range-sorted pass would give. See box_projected_multibounce.py\'s '
+                      '_leg1_occlusion_chunked_culled docstring for the derivation. Deliberately '
+                      'excluded from the ASC cache staleness fingerprint below, same reasoning as '
+                      '--leg2-culled-search and --free-pool-every: only changes HOW leg1 occlusion is '
+                      'computed, not what gets scored.')
+ap.add_argument('--asc-cache', type=str, default=None,
+                 help='script-local cache for the closed-form (ASC) side, same idea and staleness-'
+                      'guard convention as --sbr-cache -- avoids re-paying run_asc_box_projected_'
+                      'multibounce every time (cheap relative to SBR, but not free at these facet '
+                      'counts, and unhelpful to re-run when only re-plotting/re-scoring an already-'
+                      'computed result). Every flag that changes what ASC actually SCORES (not just '
+                      'how fast it runs -- free_pool_every is excluded on purpose) is stored alongside '
+                      'the arrays and checked on load; a mismatch refuses to load rather than silently '
+                      'scoring against the wrong ASC population, same as --sbr-cache.')
 args = ap.parse_args()
 
 xp, on_gpu = get_backend(args.gpu)
@@ -225,20 +295,78 @@ if on_gpu:
     cp.get_default_pinned_memory_pool().free_all_blocks()
     print("  freed cupy memory pool before closed-form stage")
 
-print(f"running closed form (box-projected, return_components=True, leg2_occlusion_check={args.leg2_occlusion}, "
-      f"split_leg2_by_target={args.split_leg2}, leg2_retroreflection_check={args.leg2_retro_check}, "
-      f"leg2_retro_taper={args.leg2_retro_taper}, leg2_building_enabled={not args.leg2_ground_only})...")
-t0 = time.perf_counter()
-s_asc, asc_stats = run_asc_box_projected_multibounce(
-    xp, on_gpu, facets_b, facets_g, plat, freqs, ref_pos,
-    ground_material=args.ground_material, return_components=True, include_order3=False,
-    progress=True, leg2_occlusion_check=args.leg2_occlusion, split_leg2_by_target=args.split_leg2,
-    leg2_retroreflection_check=args.leg2_retro_check, retro_beamwidth_mult=args.retro_beamwidth_mult,
-    leg2_building_enabled=not args.leg2_ground_only, leg2_retro_taper=args.leg2_retro_taper)
-t_asc = time.perf_counter() - t0
-print(f"  {t_asc:.2f}s wall, counts={asc_stats['counts']}")
-leg1_asc = asc_stats['s_by_leg']['leg1']
-leg2_asc = asc_stats['s_by_leg']['leg2']
+# Flags that change what ASC actually SCORES (not just how fast it runs --
+# free_pool_every is deliberately excluded, same reasoning as --sbr-cache's
+# staleness guard: a mismatch here means the cache reflects a DIFFERENT
+# scoring population, not just a different runtime).
+asc_flag_fingerprint = dict(
+    leg2_occlusion=bool(args.leg2_occlusion), split_leg2=bool(args.split_leg2),
+    leg2_retro_check=bool(args.leg2_retro_check), retro_beamwidth_mult=float(args.retro_beamwidth_mult),
+    leg2_ground_only=bool(args.leg2_ground_only), leg2_retro_taper=bool(args.leg2_retro_taper),
+    leg1_occlusion_check=bool(args.leg1_occlusion_check))
+
+have_asc_cache = False
+if args.asc_cache and os.path.exists(args.asc_cache):
+    print(f"loading cached ASC components from {args.asc_cache}...")
+    cached_asc = np.load(args.asc_cache, allow_pickle=True)
+    cached_fp = {k: cached_asc[f'flag_{k}'].item() for k in asc_flag_fingerprint if f'flag_{k}' in cached_asc.files}
+    if cached_fp != asc_flag_fingerprint:
+        print(f"  *** WARNING: this cache was built with flags {cached_fp}, but this run requested "
+              f"{asc_flag_fingerprint}. Loading it anyway would silently score against the WRONG ASC "
+              f"population. Delete this cache file or pass a new --asc-cache name. ***")
+        raise SystemExit(1)
+    t_asc = float(cached_asc['t_asc_s'])
+    print(f"  loaded ({t_asc:.1f}s original wall time)")
+    leg1_asc = xp.asarray(cached_asc['leg1'])
+    leg2_asc = xp.asarray(cached_asc['leg2'])
+    counts_asc = dict(leg1=int(cached_asc['count_leg1']), leg2=int(cached_asc['count_leg2']))
+    s_by_leg_asc = dict(leg1=leg1_asc, leg2=leg2_asc)
+    if args.split_leg2:
+        if 'leg2_ground' in cached_asc.files:
+            s_by_leg_asc['leg2_ground'] = xp.asarray(cached_asc['leg2_ground'])
+            s_by_leg_asc['leg2_building'] = xp.asarray(cached_asc['leg2_building'])
+            counts_asc['leg2_ground'] = int(cached_asc['count_leg2_ground'])
+            counts_asc['leg2_building'] = int(cached_asc['count_leg2_building'])
+        else:
+            print("  *** WARNING: --split-leg2 requested but this cache predates it -- delete and re-run. ***")
+            raise SystemExit(1)
+    asc_stats = dict(s_by_leg=s_by_leg_asc, counts=counts_asc)
+    have_asc_cache = True
+else:
+    print(f"running closed form (box-projected, return_components=True, leg2_occlusion_check={args.leg2_occlusion}, "
+          f"split_leg2_by_target={args.split_leg2}, leg2_retroreflection_check={args.leg2_retro_check}, "
+          f"leg2_retro_taper={args.leg2_retro_taper}, leg2_building_enabled={not args.leg2_ground_only}, "
+          f"leg2_culled_search={args.leg2_culled_search}, leg1_occlusion_check={args.leg1_occlusion_check}, "
+          f"leg1_occlusion_culled={args.leg1_occlusion_culled})...")
+    t0 = time.perf_counter()
+    s_asc, asc_stats = run_asc_box_projected_multibounce(
+        xp, on_gpu, facets_b, facets_g, plat, freqs, ref_pos,
+        ground_material=args.ground_material, return_components=True, include_order3=False,
+        progress=True, leg2_occlusion_check=args.leg2_occlusion, split_leg2_by_target=args.split_leg2,
+        leg2_retroreflection_check=args.leg2_retro_check, retro_beamwidth_mult=args.retro_beamwidth_mult,
+        leg2_building_enabled=not args.leg2_ground_only, leg2_retro_taper=args.leg2_retro_taper,
+        free_pool_every=args.free_pool_every,
+        leg2_culled_search=args.leg2_culled_search, culled_range_margin=args.culled_range_margin,
+        leg1_occlusion_check=args.leg1_occlusion_check,
+        leg1_occlusion_chunk_facets=args.leg1_occlusion_chunk_facets,
+        leg1_occlusion_culled=args.leg1_occlusion_culled)
+    t_asc = time.perf_counter() - t0
+    print(f"  {t_asc:.2f}s wall, counts={asc_stats['counts']}")
+    leg1_asc = asc_stats['s_by_leg']['leg1']
+    leg2_asc = asc_stats['s_by_leg']['leg2']
+
+    if args.asc_cache:
+        save_kwargs_asc = dict(leg1=to_numpy(leg1_asc), leg2=to_numpy(leg2_asc), t_asc_s=t_asc,
+                                count_leg1=asc_stats['counts'].get('leg1', 0),
+                                count_leg2=asc_stats['counts'].get('leg2', 0),
+                                **{f'flag_{k}': v for k, v in asc_flag_fingerprint.items()})
+        if args.split_leg2:
+            save_kwargs_asc['leg2_ground'] = to_numpy(asc_stats['s_by_leg']['leg2_ground'])
+            save_kwargs_asc['leg2_building'] = to_numpy(asc_stats['s_by_leg']['leg2_building'])
+            save_kwargs_asc['count_leg2_ground'] = asc_stats['counts'].get('leg2_ground', 0)
+            save_kwargs_asc['count_leg2_building'] = asc_stats['counts'].get('leg2_building', 0)
+        np.savez(args.asc_cache, **save_kwargs_asc)
+        print(f"  cached to {args.asc_cache}")
 
 
 def raw_coherence(a, b):
